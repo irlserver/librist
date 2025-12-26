@@ -51,7 +51,7 @@ int suppress_null_packets(const uint8_t payload_in[],uint8_t payload_out[], size
 		offset += packet_size;
 	}
 
-	return suppressed;
+	return (suppressed * (int)packet_size);
 fail:
 	UNSET_BIT(header_ext->flags, 7);
 	return -1;
@@ -88,5 +88,5 @@ int expand_null_packets(uint8_t payload_in[], uint8_t payload_out[], size_t *pay
 		offset += packet_size;
 	}
 
-	return *payload_len;
+	return (null_count * (int)packet_size);
 }

@@ -779,6 +779,24 @@ int rist_udp_config_free2(struct rist_udp_config **udp_config)
 	return 0;
 }
 
+int rist_sender_stats_callback_set(struct rist_ctx *ctx, int statsinterval, int (*stats_cb)(void *arg, uint16_t version, char *stats_json, uint32_t json_size), void *arg)
+{
+	if (RIST_UNLIKELY(!ctx))
+	{
+		rist_log_priv3(RIST_LOG_ERROR, "rist_sender_stats_callback_set call with null ctx!\n");
+		return -1;
+	}
+
+	if (ctx->mode == RIST_SENDER_MODE && statsinterval != 0)
+	{
+		ctx->sender_ctx->sender_stats_callback = stats_cb;
+		ctx->sender_ctx->sender_stats_callback_argument = arg;
+		ctx->sender_ctx->stats_report_time = statsinterval * RIST_CLOCK;
+	}
+
+	return 0;
+}
+
 int rist_stats_callback_set(struct rist_ctx *ctx, int statsinterval, int (*stats_cb)(void *arg, const struct rist_stats *stats_container), void *arg)
 {
 	if (RIST_UNLIKELY(!ctx))
