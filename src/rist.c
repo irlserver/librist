@@ -209,7 +209,7 @@ int rist_receiver_data_read2(struct rist_ctx *rist_ctx, struct rist_data_block *
 
 	*data_buffer = data_block;
 
-	if (RIST_UNLIKELY(f->fifo_overflow == true))
+	if (RIST_UNLIKELY(atomic_load_explicit(&f->fifo_overflow, memory_order_relaxed) == true))
 		data_block->flags |= RIST_DATA_FLAGS_OVERFLOW;
 
 	return (int)num;
@@ -707,7 +707,7 @@ uint32_t rist_peer_get_cname(const struct rist_peer *peer, const char **cname)
 	if (peer)
 	{
 		*cname = &peer->cname[0];
-		return strlen(*cname);
+		return (uint32_t)strlen(*cname);
 	}
 	else
 		return 0;

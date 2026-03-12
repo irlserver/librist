@@ -45,7 +45,7 @@ void remove_peer_from_flow(struct rist_peer *peer);
 int parse_url_udp_options(const char* url, struct rist_udp_config *output_udp_config)
 {
 	uint32_t clean_url_len = 0;
-	char* query = NULL;
+	const char* query = NULL;
 	uint32_t prefix_len = 0;
 	struct udpsocket_url_param url_params[32];
 	int num_params = 0;
@@ -55,10 +55,14 @@ int parse_url_udp_options(const char* url, struct rist_udp_config *output_udp_co
 	if (!url || !url[0] || !output_udp_config)
 		return -1;
 
-	query = strchr( url, '/' );
+	char *tmp_url = strdup( url );
+	if (!tmp_url)
+		return -1;
+
+	query = strchr( tmp_url, '/' );
 	if (query != NULL) {
-		prefix_len = (uint32_t)(query - url);
-		strncpy((void *)output_udp_config->prefix, url, prefix_len >= 16 ? 15 : prefix_len - 1);
+		prefix_len = (uint32_t)(query - tmp_url);
+		strncpy((void *)output_udp_config->prefix, tmp_url, prefix_len >= 16 ? 15 : prefix_len - 1);
 		output_udp_config->prefix[prefix_len] = '\0';
 		// Convert to lower
 		char *p =(char *)output_udp_config->prefix;
@@ -76,7 +80,7 @@ int parse_url_udp_options(const char* url, struct rist_udp_config *output_udp_co
 	}
 
 	// Parse URL parameters
-	num_params = udpsocket_parse_url_parameters( url, url_params,
+	num_params = udpsocket_parse_url_parameters( tmp_url, url_params,
 			sizeof(url_params) / sizeof(struct udpsocket_url_param), &clean_url_len );
 	if (num_params > 0) {
 		for (i = 0; i < num_params; ++i) {
@@ -116,6 +120,8 @@ int parse_url_udp_options(const char* url, struct rist_udp_config *output_udp_co
 	}
 	strncpy((void *)output_udp_config->address, url, clean_url_len >= RIST_MAX_STRING_LONG ? RIST_MAX_STRING_LONG-1 : clean_url_len - 1);
 
+	free( tmp_url );
+
 	if (ret != 0)
 		return num_params;
 	else
@@ -134,7 +140,11 @@ int parse_url_options(const char* url, struct rist_peer_config *output_peer_conf
 		return -1;
 
 	// Parse URL parameters
-	num_params = udpsocket_parse_url_parameters( url, url_params,
+	char *tmp_url = strdup( url );
+	if (!tmp_url)
+		return -1;
+
+	num_params = udpsocket_parse_url_parameters( tmp_url, url_params,
 			sizeof(url_params) / sizeof(struct udpsocket_url_param), &clean_url_len );
 	if (num_params > 0) {
 		for (i = 0; i < num_params; ++i) {
@@ -244,6 +254,8 @@ int parse_url_options(const char* url, struct rist_peer_config *output_peer_conf
 		}
 	}
 	strncpy((void *)output_peer_config->address, url, clean_url_len >= RIST_MAX_STRING_LONG ? RIST_MAX_STRING_LONG-1 : clean_url_len - 1);
+
+	free( tmp_url );
 
 	if (ret != 0)
 		return num_params;
@@ -563,10 +575,12 @@ static int receiver_enqueue(struct rist_peer *peer, uint64_t source_time, uint64
 		receiver_insert_queue_packet(f, peer, idx_initial, buf, len, seq, source_time, src_port, dst_port, packet_time);
 		atomic_store_explicit(&f->receiver_queue_output_idx, idx_initial, memory_order_release);
 
-		/* reset stats */
+		/* reset stats and timing state */
 		pthread_mutex_lock(&(get_cctx(peer)->stats_lock));
 		memset(&f->stats_instant, 0, sizeof(f->stats_instant));
 		pthread_mutex_unlock(&(get_cctx(peer)->stats_lock));
+		f->last_output_time = 0;
+		f->too_late_ctr = 0;
 		f->receiver_queue_has_items = true;
 		pthread_mutex_unlock(&f->mutex);
 		return 0; // not a dupe
@@ -979,8 +993,8 @@ static void receiver_output(struct rist_receiver *ctx, struct rist_flow *f)
 						atomic_store_explicit(&f->fifo_overflow, true, memory_order_release);
 					} else
 					{
-						if (RIST_UNLIKELY(f->fifo_overflow == true))
-							atomic_store_explicit(&f->fifo_overflow, false, memory_order_release);
+					if (RIST_UNLIKELY(atomic_load_explicit(&f->fifo_overflow, memory_order_relaxed) == true))
+						atomic_store_explicit(&f->fifo_overflow, false, memory_order_release);
 						f->dataout_fifo_queue[dataout_fifo_write_index] = block;
 						atomic_store_explicit(&f->dataout_fifo_queue_write_index, (dataout_fifo_write_index + 1)& (ctx->fifo_queue_size-1), memory_order_relaxed);
 						// Wake up the fifo read thread (poll)
@@ -3086,7 +3100,6 @@ static void sender_send_nacks(struct rist_sender *ctx)
 static void sender_send_data(struct rist_sender *ctx, int maxcount)
 {
 	int counter = 0;
-	static size_t buffer_size = 0;
 
 	while (1) {
 		// If we fall behind, only empty 100 every 5ms (master loop)
@@ -3128,31 +3141,26 @@ static void sender_send_data(struct rist_sender *ctx, int maxcount)
 			}
 		}
 
-		// Keep only buffer_size items in buffer (this controls the size of the sender queue used on retries)
+		// Keep only sender_buffer_size items in buffer (this controls the size of the sender queue used on retries)
 		int reduce = 0;
 		do {
-			size_t delete_idx = ((size_t)atomic_load_explicit(&ctx->sender_queue_read_index, memory_order_acquire) - buffer_size)& (ctx->sender_queue_max-1);
+			size_t delete_idx = ((size_t)atomic_load_explicit(&ctx->sender_queue_read_index, memory_order_acquire) - ctx->sender_buffer_size) & (ctx->sender_queue_max - 1);
 			ctx->sender_queue_delete_index = delete_idx;
 			if (ctx->sender_queue[delete_idx] && ctx->sender_queue[delete_idx]->data) {
 				/* perform the deletion based on the buffer size plus twice the configured/measured avg_rtt */
 				uint64_t delay = (timestampNTP_u64() - ctx->sender_queue[delete_idx]->time) / RIST_CLOCK;
 				ctx->sender_queue_timelength = delay;
 				if (delay < ctx->sender_recover_min_time) {
-					// this will grow the buffer size by one
-					//rist_log_priv(&ctx->common, RIST_LOG_DEBUG,
-					//		"Sender buffer size is too small, growing it to %zu, %zu\n", buffer_size, ctx->sender_queue_size);
-					buffer_size ++;
+					// Grow the buffer size by one (packet is too young to delete)
+					ctx->sender_buffer_size++;
 					reduce = 0;
-					// this continue will exit this while loop and continue in the outer loop
 					break;
 				}
 				else if (reduce == 0 && delay > ctx->sender_recover_min_time * 1.1) {
-					// this will shrink the buffer size by one
-					//rist_log_priv(&ctx->common, RIST_LOG_DEBUG,
-					//		"Sender buffer size is too large, shrinking it to %zu, %zu\n", buffer_size, ctx->sender_queue_size);
-					if (buffer_size > 0) {
+					// Shrink the buffer size by one (packet is old enough)
+					if (ctx->sender_buffer_size > 0) {
 						reduce = 1;
-						buffer_size--;
+						ctx->sender_buffer_size--;
 					}
 				}
 				else {

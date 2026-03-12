@@ -419,6 +419,7 @@ void rist_prometheus_handle_sender_peer_stats(struct rist_prometheus_stats *ctx,
 
 void rist_prometheus_parse_sender_stats(struct rist_prometheus_stats *ctx, uint16_t version, char *stats_json, uint32_t json_size, uintptr_t id)
 {
+	(void)ctx; (void)version; (void)stats_json; (void)json_size; (void)id;
 	// TODO: convert json stats to prometheus stats
 }
 
@@ -503,9 +504,9 @@ static int rist_prometheus_stats_format(struct rist_prometheus_stats *ctx) {
 		ctx->format_buf = realloc(ctx->format_buf, ((req_size + 1023) & -1024));
 		ctx->format_buf_len = ((req_size + 1023) & -1024);
 	}
-	int size = rist_prometheus_format_client_flow_stats(ctx, ctx->format_buf, ctx->format_buf_len);
+	int size = rist_prometheus_format_client_flow_stats(ctx, ctx->format_buf, (int)ctx->format_buf_len);
 
-	size += rist_prometheus_format_sender_peer_stats(ctx, &ctx->format_buf[size], ctx->format_buf_len - size);
+	size += rist_prometheus_format_sender_peer_stats(ctx, &ctx->format_buf[size], (int)ctx->format_buf_len - size);
 	for (size_t i=0; i < ctx->client_cnt; i++) {
 		ctx->clients[i]->container_count = 0;
 		ctx->clients[i]->container_offset = 0;
@@ -545,7 +546,7 @@ static MHD_OUT rist_prometheus_httpd_handler(void *cls, struct MHD_Connection *c
 		pthread_mutex_lock(&ctx->lock);
 		int size = rist_prometheus_stats_format(ctx);
 		struct MHD_Response *response = MHD_create_response_from_buffer(size, (void *)ctx->format_buf, MHD_RESPMEM_MUST_COPY);
-		MHD_add_response_header(response, "Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8; produces=text/plain");
+		MHD_add_response_header(response, "Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8");
 		int ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
 		MHD_destroy_response(response);
 		pthread_mutex_unlock(&ctx->lock);
@@ -631,7 +632,7 @@ static char *rist_prometheus_user_tags(const char *tags) {
 	if (strchr(tags, '=') == NULL) {
 		return NULL;//Doesn't contain an =, we cannot parse this
 	}
-	int len_s = strlen(tags);
+	int len_s = (int)strlen(tags);
 	int len = len_s +2;//keep room for nullbyte & ending comma
 	char *out = NULL;
 	if (strchr(tags, '"') == NULL) {

@@ -60,8 +60,8 @@ fail:
 int expand_null_packets(uint8_t payload_in[], uint8_t payload_out[], size_t *payload_len, uint8_t npd_bits) {
 	size_t packet_size = CHECK_BIT(npd_bits, 7) == 0? 188: 204;
 
-	// Non-null date 
-	int ts_count = *payload_len / packet_size;
+	// Non-null data 
+	int ts_count = (int)(*payload_len / packet_size);
 	// Null packets defined in header
 	int null_count = CHECK_BIT(npd_bits, 6) + CHECK_BIT(npd_bits, 5) + CHECK_BIT(npd_bits, 4) + CHECK_BIT(npd_bits, 3) + CHECK_BIT(npd_bits, 2) + CHECK_BIT(npd_bits, 1) + CHECK_BIT(npd_bits, 0);
 

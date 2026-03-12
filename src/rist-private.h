@@ -31,7 +31,8 @@
 #include <stdatomic.h>
 #include "librist/logging.h"
 #include "proto/gre.h"
-#include "cjson/cJSON.h"
+
+struct cJSON;
 
 #undef RIST_DEPRECATED
 
@@ -416,6 +417,7 @@ struct rist_sender {
 	size_t sender_queue_bytesize;
 	size_t sender_queue_size;
 	size_t sender_queue_timelength;
+	size_t sender_buffer_size;           /* dynamic buffer size for retry window */
 	size_t sender_queue_delete_index;
 	atomic_ulong sender_queue_read_index;
 	atomic_ulong sender_queue_write_index;
@@ -439,6 +441,7 @@ struct rist_sender {
 	/* Recovery */
 	uint32_t seq_index[UINT16_SIZE];
 	size_t sender_recover_min_time;
+	size_t sender_queue_buffer_size;
 
 	/* Reporting id */
 	intptr_t id;
@@ -637,7 +640,7 @@ static inline struct rist_common_ctx *rist_struct_get_common(struct rist_ctx *ct
 
 /* defined in flow.c */
 RIST_PRIV void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *flow);
-RIST_PRIV cJSON *rist_sender_peer_statistics(struct rist_peer *peer);
+RIST_PRIV struct cJSON *rist_sender_peer_statistics(struct rist_peer *peer);
 RIST_PRIV void rist_sender_flow_statistics(struct rist_sender *ctx);
 RIST_PRIV void rist_delete_flow(struct rist_receiver *ctx, struct rist_flow *f);
 RIST_PRIV void rist_receiver_missing(struct rist_flow *f, struct rist_peer *peer,uint64_t nack_time, uint32_t seq, uint64_t rtt);

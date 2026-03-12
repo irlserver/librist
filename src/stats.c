@@ -24,14 +24,13 @@ void rist_sender_flow_statistics(struct rist_sender *ctx)
 {
 	cJSON *stats = cJSON_CreateObject();
 	cJSON *rist_sender_stats = cJSON_AddObjectToObject(stats, "sender-stats");
-	cJSON *peers_array = cJSON_AddArrayToObject(rist_sender_stats, "peers");
 
 	pthread_mutex_lock(&ctx->common.peerlist_lock);
 	for (size_t j = 0; j < ctx->peer_lst_len; j++) {
 		struct rist_peer *peer = ctx->peer_lst[j];
 		if (!peer->dead && peer->authenticated) {
 			cJSON *peer_obj = rist_sender_peer_statistics(peer);
-			cJSON_AddItemToArray(peers_array, peer_obj);
+			cJSON_AddItemToArray(rist_sender_stats, peer_obj);
 		}
 	}
 	pthread_mutex_unlock(&ctx->common.peerlist_lock);
@@ -44,7 +43,6 @@ void rist_sender_flow_statistics(struct rist_sender *ctx)
 		cJSON_AddNumberToObject(udp_queue_obj, "packets_per_second", 1000 * ctx->sender_queue_size / ctx->sender_queue_timelength);
 	else
 		cJSON_AddNumberToObject(udp_queue_obj, "packets_per_second", 0);
-	
 	char *stats_json = cJSON_PrintUnformatted(stats);
 	cJSON_Delete(stats);
 
@@ -95,20 +93,15 @@ cJSON *rist_sender_peer_statistics(struct rist_peer *peer)
 
 	struct rist_common_ctx *cctx = get_cctx(peer);
 
-	cJSON *peer_obj = cJSON_CreateObject();
-	
-	// Add peer info
-	cJSON *peer_info = cJSON_AddObjectToObject(peer_obj, "peer");
-	cJSON_AddNumberToObject(peer_info, "flow_id", peer->adv_flow_id);
-	cJSON_AddNumberToObject(peer_info, "id", peer->adv_peer_id);
-	cJSON_AddStringToObject(peer_info, "cname", peer->receiver_name);
-	cJSON_AddStringToObject(peer_info, "type", peer->is_data ? "data" : "rtcp");
-	// Add miface to peer info
-	if (peer->miface[0]) {
-	    cJSON_AddStringToObject(peer_info, "miface", peer->miface);
-	}
-	
-	// Add stats
+	cJSON *stats = cJSON_CreateObject();
+	cJSON *rist_sender_stats = cJSON_AddObjectToObject(stats, "sender-stats");
+	cJSON *peer_obj = cJSON_AddObjectToObject(rist_sender_stats, "peer");
+	cJSON_AddNumberToObject(peer_obj, "flow_id", peer->adv_flow_id);
+	cJSON_AddNumberToObject(peer_obj, "id", peer->adv_peer_id);
+	cJSON_AddStringToObject(peer_obj, "cname", peer->receiver_name);
+	cJSON_AddStringToObject(peer_obj, "type", peer->is_data ? "data" : "rtcp");
+	if (peer->miface[0])
+		cJSON_AddStringToObject(peer_obj, "miface", peer->miface);
 	cJSON *json_stats = cJSON_AddObjectToObject(peer_obj, "stats");
 	cJSON_AddNumberToObject(json_stats, "quality", Q);
 	cJSON_AddNumberToObject(json_stats, "sent", (double)peer->stats_sender_instant.sent);
@@ -125,17 +118,9 @@ cJSON *rist_sender_peer_statistics(struct rist_peer *peer)
 	cJSON_AddNumberToObject(json_stats, "avg_rtt", (double)avg_rtt / RIST_CLOCK);
 	cJSON_AddNumberToObject(json_stats, "retry_buffer_size", (double)retry_buf_size);
 	cJSON_AddNumberToObject(json_stats, "cooldown_time", (double)time_left);
-	
-	// Create duplicate for the array
 	cJSON *peer_duplicate = cJSON_Duplicate(peer_obj, true);
-	
-	// Create stats for legacy callback
-	cJSON *legacy_stats = cJSON_CreateObject();
-	cJSON *legacy_sender_stats = cJSON_AddObjectToObject(legacy_stats, "sender-stats");
-	cJSON_AddItemToObject(legacy_sender_stats, "peer", cJSON_Duplicate(peer_info, true));
-	
-	char *stats_string = cJSON_PrintUnformatted(legacy_stats);
-	cJSON_Delete(legacy_stats);
+	char *stats_string = cJSON_PrintUnformatted(stats);
+	cJSON_Delete(stats);
 
 	stats_container->stats_json = stats_string;
 	stats_container->json_size = (uint32_t)strlen(stats_string);
@@ -205,7 +190,7 @@ void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *
 		size_t bitrate = peer->bw.eight_times_bitrate_fast / 8;
 		size_t avg_bitrate = peer->bw.eight_times_bitrate / 8;
 		flow_sent_instant += peer->stats_receiver_instant.sent_rtcp;
-		flow_rtt =+ peer->eight_times_rtt / 8;
+		flow_rtt += (uint32_t)(peer->eight_times_rtt / 8);
 
 		cJSON *peer_obj = cJSON_CreateObject();
 		cJSON_AddNumberToObject(peer_obj, "id", peer->adv_peer_id);
