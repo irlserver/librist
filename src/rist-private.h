@@ -299,6 +299,9 @@ struct rist_common_ctx {
 	/* Timers */
 	int rist_max_jitter;
 
+	/* Recovery buffer RTT multiplier (default 7, per RIST spec) */
+	int recovery_rtt_multiplier;
+
 	/* Peer list sync - RW locks */
 	struct rist_peer *PEERS;
 	pthread_mutex_t peerlist_lock;
@@ -373,6 +376,12 @@ struct rist_receiver {
 	receiver_data_callback2_t receiver_data_callback;
 	void *receiver_data_callback_argument;
 	int receiver_data_ready_notify_fd;
+
+	/* Data fd output (tunnel mode) — write received data directly to fd */
+	int receiver_data_fd;
+	uint32_t receiver_data_fd_flags;
+	atomic_uint_fast64_t data_fd_rx_packets;
+	atomic_uint_fast64_t data_fd_rx_bytes;
 
 	/* Receiver session timeout callback */
 	receiver_session_timeout_callback_t receiver_session_timeout_callback;
@@ -463,6 +472,15 @@ struct rist_sender {
 	int (*sender_stats_callback)(void *arg, uint16_t version, char *stats_json, uint32_t json_size);
 	void *sender_stats_callback_argument;
 	uint64_t stats_report_time; /* in ticks */
+
+	/* Data fd input (tunnel mode) — read from fd and send as RIST data */
+	int data_fd;
+	size_t data_fd_max_packet_size;
+	uint32_t data_fd_flags;
+	pthread_t data_fd_thread;
+	bool data_fd_thread_started;
+	atomic_uint_fast64_t data_fd_tx_packets;
+	atomic_uint_fast64_t data_fd_tx_bytes;
 };
 
 enum rist_ctx_mode {
@@ -664,6 +682,7 @@ RIST_PRIV void free_data_block(struct rist_data_block **const block);
 RIST_PRIV PTHREAD_START_FUNC(sender_pthread_protocol, arg);
 RIST_PRIV PTHREAD_START_FUNC(receiver_pthread_protocol, arg);
 RIST_PRIV int rist_max_jitter_set(struct rist_common_ctx *ctx, int t);
+RIST_PRIV int rist_recovery_rtt_multiplier_set_internal(struct rist_common_ctx *ctx, int multiplier);
 RIST_PRIV int parse_url_options(const char *url, struct rist_peer_config *output_peer_config);
 RIST_PRIV int parse_url_udp_options(const char *url, struct rist_udp_config *output_udp_config);
 RIST_PRIV struct rist_peer *rist_receiver_peer_insert_local(struct rist_receiver *ctx,

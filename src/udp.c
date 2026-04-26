@@ -77,7 +77,12 @@ size_t rist_send_seq_rtcp(struct rist_peer *p, uint16_t seq_rtp, uint8_t payload
 		memcpy(_payload - hdr_len, hdr, hdr_len);
 	}
 
-	{
+	if (RIST_UNLIKELY(payload_type == RIST_PAYLOAD_TYPE_DATA_OOB)) {
+		/* OOB uses GRE FULL protocol with no reduced/RTP header prepended,
+		   so send the raw payload without the reduced-header offset */
+		len = payload_len;
+		data = _payload;
+	} else {
 		len =  hdr_len + payload_len - RIST_GRE_PROTOCOL_REDUCED_SIZE;
 		data = _payload - hdr_len + RIST_GRE_PROTOCOL_REDUCED_SIZE;
 	}
@@ -635,15 +640,10 @@ int rist_sender_enqueue(struct rist_sender *ctx, const void *data, size_t len, u
 
 	pthread_mutex_lock(&ctx->queue_lock);
 	size_t sender_write_index = atomic_load_explicit(&ctx->sender_queue_write_index, memory_order_acquire);
-	size_t sender_delete_plus_buffer_index = (ctx->sender_queue_delete_index + ctx->sender_queue_size) & (ctx->sender_queue_max - 1);
-	// TODO: figure out why this check fails when sender_write_index = 0
-	if (RIST_UNLIKELY(sender_write_index > 0 && sender_delete_plus_buffer_index > sender_write_index)) {
-		rist_log_priv(&ctx->common, RIST_LOG_ERROR, "\nSender queue is full (%zu + %zu mod %zu = %zu > %zu), dropping packet, decrease bitrate, buffer time length or increase packet size\n",
-				ctx->sender_queue_delete_index,
+	if (RIST_UNLIKELY(ctx->sender_queue_size >= ctx->sender_queue_max - 1)) {
+		rist_log_priv(&ctx->common, RIST_LOG_ERROR, "\nSender queue is full (size=%zu max=%zu), dropping packet, decrease bitrate, buffer time length or increase packet size\n",
 				ctx->sender_queue_size,
-				ctx->sender_queue_max - 1,
-				sender_delete_plus_buffer_index,
-				sender_write_index);
+				ctx->sender_queue_max);
 		// Another solution is to increase the size of RIST_SERVER_QUEUE_BUFFERS at compile time
 		pthread_mutex_unlock(&ctx->queue_lock);
 		return -2;
@@ -820,6 +820,18 @@ ssize_t rist_retry_dequeue(struct rist_sender *ctx)
 
 	ctx->sender_retry_queue_read_index = sender_retry_queue_read_index;
 	struct rist_retry *retry = &ctx->sender_retry_queue[ctx->sender_retry_queue_read_index];
+
+	/* The peer this retry belongs to may have been destroyed while this
+	 * entry was sitting in the queue. rist_peer_remove() scrubs the slot
+	 * to NULL under peerlist_lock, and we are called with peerlist_lock
+	 * held, so seeing NULL here simply means the retry is stale; drop
+	 * it and let the caller move on to the next entry (returning 0 would
+	 * abort sender_send_nacks() and starve legitimate retries queued
+	 * behind this one). */
+	if (RIST_UNLIKELY(!retry->peer)) {
+		retry->active = false;
+		return -1;
+	}
 
 	// If they request a non-sense seq number, we will catch it when we check the seq number against
 	// the one on that buffer position and it does not match

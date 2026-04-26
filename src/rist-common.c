@@ -18,6 +18,8 @@
 #include "time-shim.h"
 #include "proto/rist_time.h"
 #include "network.h"
+#include "librist/tun.h"
+#include "librist/tunnel.h"
 #include <sys/types.h>
 #include "proto/protocol_gre.h"
 #if HAVE_SRP_SUPPORT
@@ -282,6 +284,15 @@ int rist_max_jitter_set(struct rist_common_ctx *ctx, int t)
 	return -1;
 }
 
+int rist_recovery_rtt_multiplier_set_internal(struct rist_common_ctx *ctx, int multiplier)
+{
+	if (multiplier >= 1) {
+		ctx->recovery_rtt_multiplier = multiplier;
+		return 0;
+	}
+	return -1;
+}
+
 static void init_peer_settings(struct rist_peer *peer)
 {
 	peer->eight_times_rtt = peer->config.recovery_rtt_min * 8;
@@ -459,7 +470,15 @@ static inline void receiver_mark_missing(struct rist_flow *f, struct rist_peer *
 			packet_time_last = timestampNTP_RTC_u64();
 	else
 		packet_time_last = f->receiver_queue[f->last_seq_found]->packet_time;
-	uint64_t packet_time_now = f->receiver_queue[current_seq]->packet_time;
+	uint64_t packet_time_now;
+	if (RIST_UNLIKELY(!f->receiver_queue[current_seq])) {
+		if (RIST_LIKELY(!f->rtc_timing_mode))
+			packet_time_now = timestampNTP_u64();
+		else
+			packet_time_now = timestampNTP_RTC_u64();
+	} else {
+		packet_time_now = f->receiver_queue[current_seq]->packet_time;
+	}
 	uint32_t missing_count = (current_seq - f->last_seq_found) & UINT16_MAX;
 	//arbitrary large number to prevent incorrectly marking packets as missing when wrap-around occurs & we did not correctly detect as out of order
 	if (missing_count > 32768)
@@ -768,7 +787,6 @@ static int rist_process_nack(struct rist_flow *f, struct rist_missing_buffer *b)
 				rtt = peer->config.recovery_rtt_max;
 			}
 			if (b->nack_count == 0) {
-				f->missing_counter++;
 				pthread_mutex_lock(&(get_cctx(peer)->stats_lock));
 				f->stats_instant.missing++;
 				pthread_mutex_unlock(&(get_cctx(peer)->stats_lock));
@@ -899,9 +917,12 @@ static void receiver_output(struct rist_receiver *ctx, struct rist_flow *f)
 					break;
 				}
 			}
-			pthread_mutex_lock(&ctx->common.stats_lock);
-			f->stats_instant.lost += holes;
-			pthread_mutex_unlock(&ctx->common.stats_lock);
+			size_t max_holes = f->short_seq ? (UINT16_SIZE / 2) : (f->receiver_queue_max / 2);
+			if (holes <= max_holes) {
+				pthread_mutex_lock(&ctx->common.stats_lock);
+				f->stats_instant.lost += holes;
+				pthread_mutex_unlock(&ctx->common.stats_lock);
+			}
 			output_idx = counter;
 			rist_log_priv(&ctx->common, RIST_LOG_DEBUG,
 					"Empty buffer element, flushing %"PRIu32" hole(s), now at index %zu, size is %zu\n",
@@ -976,7 +997,18 @@ static void receiver_output(struct rist_receiver *ctx, struct rist_flow *f)
 							NULL, b,
 							&payload[RIST_MAX_PAYLOAD_OFFSET], f->flow_id, flags);
 					b->data = NULL;
-					if (ctx->receiver_data_callback && block) {
+					if (ctx->receiver_data_fd >= 0 && block) {
+						int written;
+						if (ctx->receiver_data_fd_flags & RIST_DATA_FD_FLAG_TUN)
+							written = rist_tun_write(ctx->receiver_data_fd, block->payload, block->payload_len);
+						else
+							written = (int)write(ctx->receiver_data_fd, block->payload, block->payload_len);
+						if (written > 0) {
+							atomic_fetch_add_explicit(&ctx->data_fd_rx_packets, 1, memory_order_relaxed);
+							atomic_fetch_add_explicit(&ctx->data_fd_rx_bytes, (uint_fast64_t)written, memory_order_relaxed);
+						}
+						rist_receiver_data_block_free2(&block);
+					} else if (ctx->receiver_data_callback && block) {
 						rist_ref_inc(block->ref);
 						// send to callback synchronously
 						ctx->receiver_data_callback(ctx->receiver_data_callback_argument,
@@ -987,14 +1019,14 @@ static void receiver_output(struct rist_receiver *ctx, struct rist_flow *f)
 					size_t dataout_fifo_read_index = atomic_load_explicit(&f->dataout_fifo_queue_read_index, memory_order_acquire);
 					uint32_t fifo_count = (dataout_fifo_write_index - dataout_fifo_read_index)&(ctx->fifo_queue_size -1);
 					if (fifo_count +1 == ctx->fifo_queue_size || !ctx->fifo_queue_size) {
-						if (!ctx->receiver_data_callback)
+						if (!ctx->receiver_data_callback && ctx->receiver_data_fd < 0)
 							rist_log_priv(&ctx->common, RIST_LOG_ERROR, "Rist data out fifo queue overflow\n");
 						rist_receiver_data_block_free2(&block);
 						atomic_store_explicit(&f->fifo_overflow, true, memory_order_release);
-					} else
-					{
-					if (RIST_UNLIKELY(atomic_load_explicit(&f->fifo_overflow, memory_order_relaxed) == true))
-						atomic_store_explicit(&f->fifo_overflow, false, memory_order_release);
+					} else {
+						if (RIST_UNLIKELY(atomic_load_explicit(&f->fifo_overflow, memory_order_relaxed) == true)) {
+							atomic_store_explicit(&f->fifo_overflow, false, memory_order_release);
+						}
 						f->dataout_fifo_queue[dataout_fifo_write_index] = block;
 						atomic_store_explicit(&f->dataout_fifo_queue_write_index, (dataout_fifo_write_index + 1)& (ctx->fifo_queue_size-1), memory_order_relaxed);
 						// Wake up the fifo read thread (poll)
@@ -1024,8 +1056,8 @@ static void receiver_output(struct rist_receiver *ctx, struct rist_flow *f)
 			//else
 			//	fprintf(stderr, "rtcp skip at %"PRIu32", just removing it from queue\n", b->seq);
 
-			f->last_seq_output = b->seq;
 next:
+			f->last_seq_output = b->seq;
 			atomic_fetch_sub_explicit(&f->receiver_queue_size, b->size, memory_order_relaxed);
 			f->receiver_queue[output_idx] = NULL;
 			free_rist_buffer(&ctx->common, b);
@@ -1222,8 +1254,7 @@ nack_loop_continue:
 			if (!next)
 				f->missing_tail = previous;
 			*prev = next;
-			if (mb->nack_count != 0)
-				f->missing_counter--;
+			f->missing_counter--;
 			free(mb);
 			mb = next;
 		} else {
@@ -3041,8 +3072,25 @@ static void rist_oob_dequeue(struct rist_common_ctx *ctx, int maxcount)
 		}
 
 		uint8_t *payload = oob_buffer->data;
-		rist_send_common_rtcp(oob_buffer->peer, RIST_PAYLOAD_TYPE_DATA_OOB, &payload[RIST_MAX_PAYLOAD_OFFSET],
-				oob_buffer->size, 0, 0, 0, 0, 0);
+		struct rist_peer *p = oob_buffer->peer;
+		if (p->listening) {
+			/* Listener peer: send OOB to all alive child peers */
+			struct rist_peer *child = p->child;
+			bool sent = false;
+			while (child) {
+				if (!child->dead) {
+					rist_send_common_rtcp(child, RIST_PAYLOAD_TYPE_DATA_OOB, &payload[RIST_MAX_PAYLOAD_OFFSET],
+							oob_buffer->size, 0, 0, 0, 0, 0);
+					sent = true;
+				}
+				child = child->sibling_next;
+			}
+			if (!sent)
+				rist_log_priv(ctx, RIST_LOG_WARN, "OOB: listener peer has no alive children, dropping\n");
+		} else {
+			rist_send_common_rtcp(p, RIST_PAYLOAD_TYPE_DATA_OOB, &payload[RIST_MAX_PAYLOAD_OFFSET],
+					oob_buffer->size, 0, 0, 0, 0, 0);
+		}
 		ctx->oob_queue_bytesize -= oob_buffer->size;
 		ctx->oob_queue_read_index++;
 	}
@@ -3461,12 +3509,17 @@ PTHREAD_START_FUNC(sender_pthread_protocol, arg)
 		if (ctx->sender_queue_bytesize > 0) {
 			pthread_mutex_lock(&ctx->common.peerlist_lock);
 			sender_send_data(ctx, max_dataperloop);
-			pthread_mutex_unlock(&ctx->common.peerlist_lock);
-			// Group nacks and send them all at rist_max_jitter intervals
+			// Group nacks and send them all at rist_max_jitter intervals.
+			// sender_send_nacks() dereferences retry->peer for every
+			// entry in the retry queue; the peer list (and hence any
+			// given peer) can be torn down from rist_peer_destroy()
+			// concurrently, so we must hold peerlist_lock across the
+			// whole dequeue loop to prevent a use-after-free.
 			if (now > nacks_next_time) {
 				sender_send_nacks(ctx);
 				nacks_next_time += ctx->common.rist_max_jitter;
 			}
+			pthread_mutex_unlock(&ctx->common.peerlist_lock);
 		}
 		pthread_mutex_unlock(&ctx->queue_lock);
 		// Send oob data
@@ -3611,6 +3664,21 @@ int rist_peer_remove(struct rist_common_ctx *ctx, struct rist_peer *peer, struct
 		if (check->peer_rtcp == peer)
 			check->peer_rtcp = NULL;
 		check = check->next;
+	}
+
+	/* Defensive: scrub any references to this peer from the sender's
+	 * retry queue. The protocol thread now drains that queue under
+	 * peerlist_lock, so it will never see a dangling retry->peer from
+	 * here, but clearing the slot makes later triage easier and keeps
+	 * the invariant explicit. */
+	if (peer->sender_ctx && peer->sender_ctx->sender_retry_queue) {
+		struct rist_sender *sctx = peer->sender_ctx;
+		for (size_t i = 0; i < sctx->sender_retry_queue_size; i++) {
+			if (sctx->sender_retry_queue[i].peer == peer) {
+				sctx->sender_retry_queue[i].peer = NULL;
+				sctx->sender_retry_queue[i].active = false;
+			}
+		}
 	}
 	if (peer->parent) {
 		peer_remove_child(peer);
@@ -3918,8 +3986,9 @@ void _librist_receiver_buffer_calc(struct rist_receiver *ctx) {
 	struct rist_peer *p = ctx->common.PEERS;
 	while (p != NULL) {
 		if (p->config.recovery_length_max != p->config.recovery_length_min && !p->listening && p->sender_max_buffer_ticks > 0 && p->flow && p->rist_gre_version >= 2) {
-			//Optimal default according to rist spec:
-			uint64_t desired_buffer_level = (p->eight_times_rtt / 8) * 7 + p->config.recovery_reorder_buffer;
+			//Optimal default according to rist spec (multiplier configurable via API):
+			int rtt_mult = ctx->common.recovery_rtt_multiplier > 0 ? ctx->common.recovery_rtt_multiplier : 7;
+			uint64_t desired_buffer_level = (p->eight_times_rtt / 8) * rtt_mult + p->config.recovery_reorder_buffer;
 
 			bool has_high_loss = false;
 			double modifier = 1.0;

@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 project('libRIST', 'c',
-	version: '0.2.12',
+	version: '0.2.14',
 	default_options: ['c_std=c99', 'warning_level=3', 'libdir=lib'],
         meson_version: '>= 0.51.0')
 
@@ -17,9 +17,9 @@ cdata = configuration_data()
 #If any interfaces have been added, removed, or changed since the last update, increment current, and set revision to 0.
 #If any interfaces have been added since the last public release, then increment age.
 #If any interfaces have been removed or changed since the last public release, then set age to 0.
-librist_abi_current = 9
-librist_abi_revision = 0
-librist_abi_age = 5
+librist_abi_current = 10
+librist_abi_revision = 2
+librist_abi_age = 6
 librist_soversion = librist_abi_current - librist_abi_age
 librist_version = '@0@.@1@.@2@'.format(librist_abi_current - librist_abi_age, librist_abi_age, librist_abi_revision)
 
@@ -30,7 +30,7 @@ librist_version = '@0@.@1@.@2@'.format(librist_abi_current - librist_abi_age, li
 #PATCH not used (doesn't make sense for API version, remains here for backwards compat)
 
 librist_api_version_major = 4
-librist_api_version_minor = 6
+librist_api_version_minor = 7
 librist_api_version_patch = 0
 
 librist_src_root = meson.current_source_dir()
@@ -39,16 +39,19 @@ deps = []
 platform_files = []
 inc = []
 inc += include_directories('.', 'src', 'include/librist', 'include', 'contrib')
-if (host_machine.system() == 'darwin'
-    and find_program('brew', required : false).found())
-	r = run_command('brew', '--prefix', check: true)
-	brewoutput = r.stdout().strip()
-	inc += include_directories(brewoutput + '/include')
-endif
 
 #builtin_lz4 = get_option('builtin_lz4')
 builtin_cjson = get_option('builtin_cjson')
 builtin_mbedtls = get_option('builtin_mbedtls')
+
+if (host_machine.system() == 'darwin'
+    and not meson.is_cross_build()
+    and find_program('brew', required : false).found()
+    and (not builtin_cjson or not builtin_mbedtls))
+	r = run_command('brew', '--prefix', check: true)
+	brewoutput = r.stdout().strip()
+	inc += include_directories(brewoutput + '/include')
+endif
 use_mbedtls = get_option('use_mbedtls')
 use_nettle = get_option('use_nettle')
 use_gnutls = get_option('use_gnutls')
@@ -78,6 +81,7 @@ have_clock_gettime = false
 threads = []
 test_args = []
 if host_machine.system() == 'windows'
+	platform_files += 'src/tun_win.c'
 	deps += [
 		cc.find_library('ws2_32'),
 		cc.find_library('iphlpapi')
@@ -101,10 +105,23 @@ windows_version_test = '''
 			threads = dependency('threads')
 			deps += threads
 			cdata.set('HAVE_PTHREADS', 1)
-			have_clock_gettime =  cc.has_function('clock_gettime', prefix : '#include <time.h>', args : test_args, dependencies: threads)
+			# Use has_header_symbol so mingw-w64's static inline clock_gettime
+			# (declared in <pthread_time.h> pulled in by <time.h>) is detected.
+			# has_function does a linker test and would miss it because
+			# winpthreads only exports clock_gettime32/clock_gettime64.
+			have_clock_gettime = cc.has_header_symbol('time.h', 'clock_gettime', args : test_args)
 		endif
 	else
 		have_pthreads = false
+	endif
+	if cc.get_id() == 'msvc'
+		# librist uses C11 features (stdatomic.h, mixed declarations).
+		# MSVC only exposes them under /std:c11 or /std:c17.
+		if cc.has_argument('/std:c11')
+			add_project_arguments(['/std:c11'], language: 'c')
+		elif cc.has_argument('/std:c17')
+			add_project_arguments(['/std:c17'], language: 'c')
+		endif
 	endif
 	add_project_arguments(['-DWIN32_LEAN_AND_MEAN'], language: 'c')
 	add_project_arguments(['-D__USE_MINGW_ANSI_STDIO=1'], language: 'c')
@@ -115,6 +132,7 @@ windows_version_test = '''
 	librist_soversion = ''
 else
 	if host_machine.system() == 'linux' or host_machine.system() == 'android'
+		platform_files += 'src/tun_linux.c'
 		test_args += '-D_GNU_SOURCE'
 		add_project_arguments('-D_GNU_SOURCE', language: 'c')
 		if cc.check_header('linux/if_alg.h')
@@ -135,6 +153,7 @@ void test(void) {
 			inc += include_directories('compat/android')
 		endif
 	elif host_machine.system() == 'darwin'
+		platform_files += 'src/tun_darwin.c'
 		test_args += '-D_DARWIN_C_SOURCE'
 		add_project_arguments('-D_DARWIN_C_SOURCE', language: 'c')
 	elif host_machine.system() == 'gnu'
@@ -234,14 +253,6 @@ if builtin_cjson
 	cjson_lib = declare_dependency( compile_args : '-DCJSON_HIDE_SYMBOLS',
 									sources: 'contrib/contrib_cJSON/cjson/cJSON.c',
 									include_directories : include_directories('contrib/contrib_cJSON'))
-endif
-
-if get_option('use_tun')
-	if host_machine.system() == 'linux' and cc.check_header('linux/if_tun.h')
-		add_project_arguments(['-DUSE_TUN'], language: 'c')
-	else
-		error('TUN only supported on linux at this moment')
-	endif
 endif
 
 crypto_deps = []
@@ -387,7 +398,7 @@ if get_option('static_analyze')
 	run_target('analyze', command: ['bash', join_paths(librist_src_root, 'common/scripts/analyze.sh')])
 endif
 
-librist_dep = declare_dependency(include_directories: inc, link_with : librist)
+librist_dep = declare_dependency(include_directories: inc, link_with : librist, dependencies : stdatomic_dependency)
 
 if get_option('built_tools')
 	message('Building tools')
