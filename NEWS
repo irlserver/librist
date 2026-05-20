@@ -5,6 +5,471 @@ A library implementing the Video Services Forum (VSF) Technical
 Recommendations TR-06-1 (Simple Profile) and TR-06-2 (Main Profile).
 
 
+Changes for 0.2.16 (pre-release):
+---------------------------------
+
+ABI/API:
+  - ABI version 10:4:6 (soversion 4, binary-compatible with 0.2.15)
+  - API version 4.7.0 (unchanged)
+
+  Maintenance release for 0.2.15. No source or binary changes are
+  required of downstream consumers.
+
+Bug Fixes:
+
+  Windows:
+  - Windows tools fail to start when remote logging is enabled.
+    Running `ristreceiver -r 127.0.0.1:port ...` on Windows 11 would
+    exit immediately with "Failed to setup logging!" because winsock
+    had not been initialised before the public logging API tried to
+    open a UDP socket. Fixes #208 (reported by Roman Dissertori).
+  - EAP-SRP authentication fails on Windows with multiple peers.
+    A 0.2.15 regression: an outbound packet that drew an ICMP
+    port-unreachable reply caused Windows to corrupt the next
+    incoming UDP datagram on the same socket, which then broke the
+    EAP handshake. Most visible with bonded ethernet+wifi peers,
+    Linux ristsender -> Windows ristreceiver. Fixes #209 (reported
+    and confirmed fixed by Roman Dissertori).
+  - Windows socket failure log lines now include the actual WSA
+    error code, so user bug reports from Windows are diagnosable.
+  - Cryptographic random number generator now seeds reliably on
+    Windows runtimes where the legacy CryptoAPI (CryptAcquireContext
+    / CryptGenRandom) is missing or unconfigured - notably wine and
+    some sandboxed container builds. The seeding path now uses the
+    modern BCryptGenRandom (CNG) API, supported on every shipping
+    Windows version. Without this fix, the 0.2.15 CSPRNG hardening
+    refused to start the SRP/AES code paths in those environments
+    rather than silently downgrade. Fixes #210.
+
+Hardening / follow-ups to 0.2.15:
+
+  - EAP-SRP authentication retry exhaustion did not drop the failed
+    peer. A latent sign-comparison bug meant a peer that failed
+    every authentication retry was kept around in a half-
+    authenticated state instead of being dropped. Not externally
+    reported.
+  - Crypto random number generator could silently downgrade to a
+    weak fallback. If the CSPRNG seed call failed at startup (no
+    kernel entropy source - sandboxed container, embedded image
+    without /dev/urandom, broken build), the failure was dropped
+    and the wall-clock-derived stopgap was used for the lifetime of
+    the process. Now logs loudly and refuses to hand out random
+    bytes. Not externally reported.
+  - Internal EAP error code documentation: clarify a guard comment
+    that read as a removable paranoia check but is actually
+    protecting against a NULL function pointer.
+
+  Post-0.2.15 audit follow-ups (reported by Thomas Guillem):
+
+  Receiver flow / peer accounting:
+  - Receivers no longer crash or corrupt their peer list when a
+    peer is added to a flow at the same instant another thread is
+    removing one. The list of peers per flow was being walked by
+    one thread under one lock and modified by another thread under
+    a different lock; the two paths now agree. A 256-peer-per-flow
+    cap is also enforced so a misconfigured (or hostile) sender
+    cannot grow the list without bound.
+  - Receivers stop creating flows once 256 active flows already
+    exist. Previously the count was checked and the new flow
+    allocated in separate steps, so a burst of new flow IDs could
+    race past the limit. Now the count check and the slot insert
+    happen under the same lock.
+
+  EAP-SRP authenticator:
+  - Authenticated peers can no longer be deauthenticated by a
+    spoofed EAPOL-LOGOFF. A successfully authenticated session
+    used to reset to start-over state on receipt of any LOGOFF
+    packet, which made the auth state machine trivially DoSable
+    from off-path. LOGOFF is now only honoured before the session
+    reaches authenticated state, and a legitimate LOGOFF before
+    that point also resets the retry counter so a counter
+    wrap-around can't lock the peer out for the lifetime of the
+    process.
+  - A spoofed EAP FAILURE no longer pushes the local state machine
+    into permanent failure. FAILURE packets are now matched
+    against the identifier of the in-flight EAP exchange and
+    dropped if they don't match, the same way Request/Response are
+    matched. A genuine FAILURE still latches the peer out, but
+    after a 30-second quiet period the peer is allowed to retry
+    from the start so a transient burst of bad responses doesn't
+    require restarting the process.
+  - EAP authenticators no longer answer EAP Identity requests
+    themselves. The handler used to run on both roles, so a
+    misbehaving (or attacker-controlled) authenticatee could
+    persuade the authenticator to discard its own session state
+    and start over. The handler is now restricted to the
+    authenticatee role, and even there it is rate-limited so the
+    pre-auth reset cannot be triggered repeatedly to wipe
+    in-progress sessions.
+  - EAP SRP setup now caps the advertised modulus (N) and
+    generator (g) lengths at 1024 bytes (8192-bit groups, the
+    largest standard RFC 5054 group). A peer that advertised
+    multi-megabyte values used to allocate that much memory and
+    burn that much CPU on bignum imports before deciding the
+    handshake was bogus.
+
+  PSK encryption:
+  - The PSK nonce generator no longer falls back to a
+    wall-clock-derived value when the CSPRNG misbehaves. Nonces
+    are required to come from the system CSPRNG; if it fails or
+    returns suspect output the key is marked broken, encryption
+    refuses to produce ciphertext for that key (sends zeroes
+    instead so a downstream consumer cannot mistake it for a
+    successful encrypt), and the existing audible logging fires.
+    Decryption was already locked out in the same condition; this
+    closes the encrypt-side gap. The non-security-critical
+    `prand_u32` helper used elsewhere in the tree keeps its
+    wall-clock fallback because its callers don't need
+    unpredictability.
+  - PSK decryption now skips the PBKDF2 key derivation when the
+    key is already locked out. A bursty stream of malformed
+    encrypted packets at a peer whose key state was already
+    compromised used to spin tens of thousands of PBKDF2 rounds
+    per packet before rejecting it. The lockout check now happens
+    first, so the per-packet cost drops to a few comparisons.
+  - PSK AES-CTR dispatch no longer silently falls back to AES-128
+    on an unknown key size. The earlier switch-case used a
+    fallthrough that meant a corrupted or unsupported key length
+    would still be processed (with the wrong cipher), which
+    masked configuration errors. Unknown key sizes now return
+    without touching the buffer.
+
+  SRP / cryptographic primitives:
+  - The Nettle build of SRP no longer feeds uninitialized stack
+    into the bignum library when the CSPRNG returns no entropy.
+    The Nettle random callback's signature returns void, so a
+    CSPRNG failure was previously dropped on the floor and the
+    caller computed against whatever was on the stack. The
+    callback now zeroes its output buffer and signals the caller
+    via a side-channel context; the bignum operation then fails
+    cleanly. The mbedTLS build was already correct.
+  - The SRP NG (N/g) group identifier enum now keeps its
+    pre-0.2.15 integer values. The 0.2.15 release deleted the two
+    smallest groups (NG_512, NG_768 - both below current
+    minimum-strength thresholds) but shifted every remaining
+    enum entry down by two as a side effect. The integer "2",
+    which any external caller might reasonably have hardcoded
+    for NG_1024, silently started meaning NG_4096. The deleted
+    values 0 and 1 are now explicit reserved slots that return
+    "no such group" - code that uses the named constants
+    (`LIBRIST_SRP_NG_1024` etc.) is unaffected, code that used
+    literal integers either gets the group it asked for or a
+    clean error.
+
+  Statistics JSON:
+  - The stats JSON payloads (sender flow, sender per-peer wrapper,
+    receiver flow) now carry an explicit top-level
+    `schema_version` field. The current value is 2 - version 1 was
+    the duplicate-`peer`-key sender shape that v0.2.15 replaced
+    with a `peers` array (NEWS noted the change, but downstream
+    parsers had no way to detect which shape they were getting).
+    Any future incompatible shape change must bump this number.
+  - The sender `cname` field copy is now explicitly
+    NUL-terminated. The previous strncpy with a destination-sized
+    length depended on a separate bounds check elsewhere in the
+    receive path to keep the result safe; the contract is now
+    self-contained.
+
+  Build / portability:
+  - librist now requires mbedTLS >= 2.7 (March 2018), and emits a
+    clean #error if built against anything older. The compatibility
+    branch for pre-2.7 mbedTLS releases (which used the
+    void-returning SHA-256 API) had no CI coverage and was the
+    same untestable corner that produced a 0.2.14 build break -
+    dropping it removes the surface area entirely. Every still-
+    supported distro is well past 2.7; the bundled tree is 2.28.x.
+  - On Windows, the mbedTLS CSPRNG seed no longer reaches into
+    private mbedtls_entropy_context fields to keep its source
+    count happy. It now seeds the CTR_DRBG directly from
+    BCryptGenRandom, skipping the entropy module entirely on
+    Windows. Non-Windows builds still use the normal entropy
+    initialisation path.
+
+Test / CI:
+  - New unit test (logging_init_order) that exercises the
+    rist_logging_set remote-address path before any rist_*_create
+    call. Would have caught #208 on the first Windows-CI run.
+  - The full meson test suite now runs against the cross-compiled
+    Windows binaries under wine, not just on Linux. Every protocol
+    test that gates Linux releases also gates Windows releases,
+    including the SRP / AES encryption suites which are now built
+    with mbedTLS on Windows (see the #210 fix above). The wine
+    runtime was already provisioned in the CI image; only the test
+    invocation was missing. Catches Windows-runtime regressions
+    without requiring a native Windows runner.
+  - Per-test results from the Linux job now show up directly in the
+    GitLab MR UI via meson's JUnit output, so reviewers don't have
+    to read job logs to see which test failed.
+
+
+Changes for 0.2.15 (2026-05-14):
+--------------------------------
+
+ABI/API:
+  - ABI version 10:3:6 (soversion 4, binary-compatible with 0.2.14)
+  - API version 4.7.0 (unchanged)
+
+  Security release. Existing 0.2.14 installations remain
+  binary-compatible; downstream consumers do not need to recompile.
+
+Security Fixes:
+
+  Receive-side parsers and key handling were audited end to end. Each
+  fix below is independent.
+
+  Receive path / RTCP:
+  - rist-common: bounds-check the RTP and RTP-extension headers.
+    The earlier check only covered the 4-byte reduced port subheader;
+    a truncated packet underflowed payload.size to ~SIZE_MAX which
+    then drove a malloc(len + 32) on the receiver enqueue path.
+  - rist-common: harden the RTCP dispatcher. Off-by-one in
+    bytes_left, integer overflow in 4*(1+records) (CPU spin on a
+    single packet), and an SDES handler that let 255 bytes be
+    memcpy'd into a 128-byte struct member, overrunning the adjacent
+    peer config/key state.
+  - rist-common: bound the XR block parser, clamp the on-the-wire
+    length to what we received, and guard the DLRR delay subtraction
+    so it can no longer pin last_rtt near UINT64_MAX (which would
+    permanently disable NACK timing on the peer).
+  - rist-common: validate the sender NACK record count before
+    iterating. ntohs(rtcp->len) - 2 underflowed to ~65K on a
+    malformed feedback packet, enqueueing OOB bytes as retransmit
+    requests and leaking them back to the peer.
+  - rist-common: add the missing return after the VSF length check,
+    and derive odd_nonce from the actual nonce byte rather than
+    GRE flags1 (the latter silently disabled the OTF passphrase
+    rotation feature on the receive side).
+  - rtcp: guard the RR and echo-response RTT subtractions and
+    size-check the SR / echo-request / echo-response casts (same
+    RTT-underflow primitive as above on the RR/echo paths).
+  - rtcp: correct the XR echoreq RTCP length field per RFC 3550;
+    receivers were reading 4 bytes past the actual XR block.
+  - mpegts: bound NPD expansion to the 7-packet wire encoding.
+    expand_null_packets used attacker-controlled payload_len and
+    npd_bits to drive ts_count and write up to 11 KB into a 10 KB
+    recv_npd buffer (overrunning into the adjacent RTCP TX buffer),
+    and shifted by a negative amount when ts_count > 7.
+  - gre: zero-init keepalive info on short packet and check return,
+    otherwise a truncated keepalive disclosed stack memory through
+    the user logging callback.
+  - udpsocket: NUL-terminate the URL hostname after strncpy so
+    udpsocket_resolve_host cannot over-read.
+
+  PSK / AES-CTR:
+  - crypto: reject zero-nonce PSK packets instead of skipping
+    decryption. The previous early-return left the recv buffer
+    untouched and the caller treated the attacker's plaintext as a
+    freshly-decrypted Main Profile packet, bypassing the configured
+    PSK per packet. Pre-auth, single packet.
+  - crypto: correct nettle AES-CTR dispatch for 128/192-bit keys.
+    AES-128 was using nettle_aes192_encrypt against an aes128
+    context; the AES-192 case was missing entirely, leaving an
+    uninitialised function pointer hot on the EAP password-rotation
+    path.
+
+  EAP / SRP:
+  - eap: validate EAPOL/EAP/SRP-TLV lengths end to end. The body
+    length check was inverted and inner dispatchers walked past the
+    recv buffer with attacker-supplied lengths, exfiltrating heap
+    bytes through username copies and AES-CTR rewrites. Adjacent
+    fixes cover EAP header / dispatch / passphrase-flags reads.
+  - eap: NULL-check auth_ctx and propagate handle_A failure (notably
+    A == 0 mod N) so a rejected SRP exchange actually fails auth
+    instead of sending an uninitialised B back to the client. NULL
+    check the SRP client ctx and propagate the int-typed return of
+    the A/B writers (a -1 wrapped to ~SIZE_MAX and crashed on the
+    last_pkt malloc cache path).
+  - eap: bound rist_eap_send_passphrase to the destination buffer;
+    an over-long passphrase from the API or YAML config overran
+    ctx->unsollicited_passphrase into adjacent heap fields used by
+    the periodic retransmit.
+  - eap: rate-limit the EAP_CODE_FAILURE restart loop. The handler
+    unconditionally called eap_reset_data + log + EAPOL_START with
+    no retry counting, so a spoofed FAILURE per round-trip kept us
+    bouncing through reset+restart forever.
+  - eap: write the empty server-name placeholder into outpkt rather
+    than pkt (pure copy/paste typo that corrupted the recv buffer
+    on every successful identity response).
+  - srp: propagate failure when the client A, server B, or u is
+    congruent to 0 mod N. The checks existed but the failure path
+    left ret==0 so the caller continued the exchange. Auth bypass
+    primitive on both sides.
+
+  PRNG:
+  - crypto: route prand_u32 through the CSPRNG. The previous
+    implementation called rand() seeded with a wall-clock NTP
+    timestamp; the result is used for the PSK GRE nonce (input to
+    PBKDF2), the EAP identifier and the peer SSRC. Reuse the mbedTLS
+    CTR-DRBG / GnuTLS RNG that already backs SRP key generation.
+  - crypto: fix operator-precedence bug in random_get_string and
+    add an upper bound on the local rand buffer. Affected callers
+    that ask for a runtime-derived password.
+
+Hygiene (not security-impacting on their own but shipped in the same
+release):
+  - flow: handle realloc/calloc failure on the peer-list growth path
+    and rist_receiver_missing; correct two log format strings
+    (uint32_t printed with PRIu64; pointer where a PRIu32 was due).
+  - libevsocket: preserve the global context list when removing the
+    head; ctx_del previously cleared CTX_LIST instead of advancing
+    it to c->next.
+  - eap, logging, udpsocket: NULL-check the malloc/calloc results
+    that were dereferenced unconditionally; free the calloc'd ctx
+    on pthread_mutex_init failure in eap_clone_ctx; close the bound
+    socket on the multicast-join failure leg.
+  - network: on the GNU/Hurd MAC-address path, check socket() and
+    close it on the getifaddrs() failure leg.
+
+Additional fixes from the VideoLAN security audit:
+
+  Independent receive-side / EAP / SRP audit shared by VideoLAN.
+  The findings already covered above are not re-listed; the items
+  below close the residual gaps.
+
+  EAP / SRP:
+  - eap: ignore EAP_REQUEST_IDENTITY once we're past
+    EAP_AUTH_STATE_SUCCESS so a single forged identity request can
+    no longer tear an established session down and re-emit the
+    configured username on the wire.
+  - eap: refuse RESPONSE/IDENTITY on the authenticatee side
+    (lookup_func is NULL there per the calloc setup path; the
+    handler used to deref it unconditionally).
+  - eap: free verifier_data on every exit from
+    process_eap_response_identity. Three error paths returned -1
+    before reaching the cleanup block, leaking the four heap
+    allocations the verifier lookup callback handed back.
+  - srp: jump to failed: instead of returning out of
+    BIGNUM_WRITE_BYTES when MPI write fails inside calc_x; the
+    return -1 path leaked hash_data.
+  - srp: check librist_crypto_srp_hash_bignum return in
+    calculate_m. The helper returns -1 (and leaves the output
+    buffer untouched) when the bignum exceeds its 1024-byte
+    staging buffer; the unchecked path XOR'd uninitialised stack
+    into the SRP transcript.
+  - srp: BIGNUM_INIT k and B in the authenticator constructor.
+    Relying on calloc-zeroed mbedtls_mpi state happened to work
+    today but the public mbedTLS contract requires explicit init.
+  - srp: bound A and B operand sizes against N before exp_mod.
+    handle_A and client_handle_B accepted any length from the
+    wire; mbedtls_mpi_exp_mod runtime grows with operand size.
+  - srp: NULL the caller's *bytes_s/*bytes_v in _create_verifier
+    failure paths so eap_reset_data does not double-free them.
+  - srp: capture mbedtls_mpi_fill_random return when generating
+    the salt; the previous `if (ret != 0)` re-checked the prior
+    BIGNUM_FROM_STRING.
+  - srp: repair the !USE_SHA_RET branch of librist_crypto_srp_hash
+    (referenced symbols from a different function and was missing
+    its trailing semicolon).
+  - srp: drop the sub-1024-bit RFC 5054 groups (NG_512, NG_768).
+    The enum was internal; the unit-test fixture that wanted the
+    deterministic 512-bit exchange now inlines the constants.
+
+  PSK / AES-CTR:
+  - psk: fail closed when PBKDF2 setup fails on the mbedTLS path.
+    mbedtls_md_setup / mbedtls_pkcs5_pbkdf2_hmac errors used to
+    fall through into mbedtls_aes_setkey_enc with the
+    stack-allocated aes_key buffer in undefined state.
+  - psk: don't let an attacker-chosen nonce reset the bad-packet
+    lockout. _librist_crypto_psk_decrypt now keeps bad_decryption
+    set across nonce rolls so the five-bad-packets cap is no
+    longer trivially bypassed by sending a different nonce on
+    every shot.
+  - psk: use memcpy for the GRE nonce load instead of a punned
+    uint32_t cast (strict-aliasing UB; faulted on architectures
+    that require aligned uint32_t loads).
+
+  Receive path:
+  - rist-common: lift the rist_rtp_hdr size check above the
+    Simple/REDUCED conditional so Main-profile FULL/EAPOL paths
+    can no longer read past recv_bufsize.
+  - udp: size the NPD scratch buffer for the real worst case
+    (7 * 204 + sizeof(rist_rtp_hdr_ext)). The previous 6 * 204 + 4
+    was four bytes short for the (count == 7, suppressed == 1)
+    output and let suppress_null_packets smash four bytes of
+    stack past tmp_buf.
+  - rist-common: cast keepalive json_len to int for %.*s. size_t
+    via varargs is undefined per the C standard.
+
+  Flow / threading:
+  - flow: take f->mutex when growing peer_lst; the realloc could
+    move storage and concurrent walkers (rist_best_rtt_index, the
+    output thread, stats) read peer_lst without synchronization.
+  - flow: cap receiver flows at RIST_MAX_FLOWS (256) and walk
+    FLOWS under flows_lock. Without a cap an attacker that can
+    land traffic on a receiver can exhaust memory by walking the
+    32-bit flow_id space.
+  - flow: NULL-check the dataout_fifo_queue calloc; the
+    data-output thread used to write into it unconditionally.
+
+  TUN / RTCP TX / utility:
+  - tun_linux, tun_darwin: bounds-check prefix_len before computing
+    the netmask. prefix_len < 0 hit undefined behaviour in C and
+    prefix_len == 32 produced a 32-bit shift on a uint32_t (also
+    UB).
+  - tun_darwin: parse the utun unit suffix with strtoul, not atoi,
+    with full validation; falls back to "let the kernel pick" on
+    parse failure.
+  - rtp: clamp SDES name_len to 255 before computing sdes_size so
+    the on-the-wire length byte and the actual bytes copied stay
+    in agreement.
+  - rist-common: make compare() return a real three-way result
+    (qsort's contract is < 0 / 0 / > 0; the previous boolean cast
+    was undefined per POSIX).
+  - rist-common: pick the actual median in recalculate_clock_offset
+    (the index was biased high by one).
+
+Bug Fixes:
+  - rist-common: initialize peer->sd to -1 in peer_initialize so a
+    DNS resolution failure no longer leaves a zero socket
+    descriptor wired up to the event loop, which on Windows turned
+    into an infinite POLLERR loop and on Unix could attach the RIST
+    state to fd 0 (stdin). (!312, Yannick Le Roux)
+  - logging: check log_socket >= 0 instead of just non-zero in the
+    rist_log_impl UDP path, matching the LOGGING_SETTINGS_INITIALIZER
+    sentinel (the early-exit was tightened in f7ace4d but the send
+    branch still treated 0 as a valid fd). (!313, Daisuke Matsunami)
+  - stats: emit sender peers under a "peers" array. The previous
+    shape used "peer" as the key for every peer object, producing
+    invalid JSON and silently dropping all but one peer in strict
+    parsers. (#206, Manuel Alejandro)
+
+Tools:
+  - prometheus-exporter: implement rist_prometheus_parse_sender_stats.
+    The hook for ristsender's JSON stats callback was a TODO stub, so
+    sender-side rist_sender_peer_* gauges/counters never showed up at
+    the scrape endpoint. The parser now walks the new "peers" array
+    and feeds rist_prometheus_handle_sender_peer_stats; metric names
+    and shape are unchanged from the receiver-callback path.
+    (closes the second half of #206)
+  - ristsender: drop a duplicate rist_sender_stats_callback_set call
+    in setup_rist_peer that overwrote the per-instance arg with NULL,
+    breaking sender attribution when more than one sender ran in the
+    same process.
+  - udp2udp: log a one-shot warning when --metrics is enabled noting
+    that the relay produces no rist_* series (it uses librist only
+    for URL parsing and the httpd shell).
+
+Windows / MinGW Build:
+  - rist.c: return integer (not NULL) from the PTHREAD_START_FUNC
+    bodies. The macro expands to a DWORD __stdcall function on
+    Windows without HAVE_PTHREADS, which gcc14 rejected.
+  - meson: always probe clock_gettime via has_header_symbol on
+    Windows, not only when have_mingw_pthreads=true. Modern
+    mingw-w64 ships clock_gettime as a static inline in <time.h>
+    regardless of winpthreads, so contrib/time-shim.c collided
+    with the toolchain definition on the default build.
+  - rist-common: drain WSAECONNRESET with a real recvfrom buffer
+    on the rist_peer_sockerr POLLERR path. The previous NULL-buffer
+    call returned WSAEFAULT and left the indication in the socket
+    queue, causing WSAPoll to fire POLLERR in a tight loop and
+    flood the log with "Socket error!" whenever a peer went away.
+    (#205, Manuel Alejandro)
+  - tools: centralize the strtok_r/strtok_s shim in a header so
+    rist2rist (and any future tool that needs strtok_r) builds on
+    MinGW / MSVC. ristsender and ristreceiver had inline shims;
+    rist2rist's recent multi-peer bonding work added strtok_r
+    without one and failed to link. (#207, Thierry Lelegard)
+
 Changes for 0.2.14 (2026-04-25):
 --------------------------------
 

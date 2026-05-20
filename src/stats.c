@@ -14,6 +14,9 @@
 #include <string.h>
 #include "cjson/cJSON.h"
 
+/* Bump on any incompatible shape change to the stats JSON payloads. */
+#define RIST_STATS_JSON_SCHEMA_VERSION 2
+
 static double round_two_digits(double number)
 {
 	long new_number = (long)(number * 100);
@@ -23,14 +26,16 @@ static double round_two_digits(double number)
 void rist_sender_flow_statistics(struct rist_sender *ctx)
 {
 	cJSON *stats = cJSON_CreateObject();
+	cJSON_AddNumberToObject(stats, "schema_version", RIST_STATS_JSON_SCHEMA_VERSION);
 	cJSON *rist_sender_stats = cJSON_AddObjectToObject(stats, "sender-stats");
+	cJSON *peers = cJSON_AddArrayToObject(rist_sender_stats, "peers");
 
 	pthread_mutex_lock(&ctx->common.peerlist_lock);
 	for (size_t j = 0; j < ctx->peer_lst_len; j++) {
 		struct rist_peer *peer = ctx->peer_lst[j];
 		if (!peer->dead && peer->authenticated) {
 			cJSON *peer_obj = rist_sender_peer_statistics(peer);
-			cJSON_AddItemToArray(rist_sender_stats, peer_obj);
+			cJSON_AddItemToArray(peers, peer_obj);
 		}
 	}
 	pthread_mutex_unlock(&ctx->common.peerlist_lock);
@@ -93,9 +98,7 @@ cJSON *rist_sender_peer_statistics(struct rist_peer *peer)
 
 	struct rist_common_ctx *cctx = get_cctx(peer);
 
-	cJSON *stats = cJSON_CreateObject();
-	cJSON *rist_sender_stats = cJSON_AddObjectToObject(stats, "sender-stats");
-	cJSON *peer_obj = cJSON_AddObjectToObject(rist_sender_stats, "peer");
+	cJSON *peer_obj = cJSON_CreateObject();
 	cJSON_AddNumberToObject(peer_obj, "flow_id", peer->adv_flow_id);
 	cJSON_AddNumberToObject(peer_obj, "id", peer->adv_peer_id);
 	cJSON_AddStringToObject(peer_obj, "cname", peer->receiver_name);
@@ -118,14 +121,20 @@ cJSON *rist_sender_peer_statistics(struct rist_peer *peer)
 	cJSON_AddNumberToObject(json_stats, "avg_rtt", (double)avg_rtt / RIST_CLOCK);
 	cJSON_AddNumberToObject(json_stats, "retry_buffer_size", (double)retry_buf_size);
 	cJSON_AddNumberToObject(json_stats, "cooldown_time", (double)time_left);
-	cJSON *peer_duplicate = cJSON_Duplicate(peer_obj, true);
+	cJSON *stats = cJSON_CreateObject();
+	cJSON_AddNumberToObject(stats, "schema_version", RIST_STATS_JSON_SCHEMA_VERSION);
+	cJSON *rist_sender_stats = cJSON_AddObjectToObject(stats, "sender-stats");
+	cJSON *peers = cJSON_AddArrayToObject(rist_sender_stats, "peers");
+	cJSON_AddItemToArray(peers, cJSON_Duplicate(peer_obj, true));
 	char *stats_string = cJSON_PrintUnformatted(stats);
 	cJSON_Delete(stats);
 
 	stats_container->stats_json = stats_string;
 	stats_container->json_size = (uint32_t)strlen(stats_string);
-	stats_container->stats.sender_peer.cname[0] = '\0';
-	strncpy(stats_container->stats.sender_peer.cname, peer->receiver_name, RIST_MAX_STRING_SHORT);
+	strncpy(stats_container->stats.sender_peer.cname,
+		peer->receiver_name,
+		sizeof(stats_container->stats.sender_peer.cname) - 1);
+	stats_container->stats.sender_peer.cname[sizeof(stats_container->stats.sender_peer.cname) - 1] = '\0';
 	stats_container->stats.sender_peer.peer_id = peer->adv_peer_id;
 	stats_container->stats.sender_peer.bandwidth = bitrate;
 	stats_container->stats.sender_peer.retry_bandwidth = retry_bitrate;
@@ -144,7 +153,7 @@ cJSON *rist_sender_peer_statistics(struct rist_peer *peer)
 	memset(&peer->stats_sender_instant, 0, sizeof(peer->stats_sender_instant));
 	pthread_mutex_unlock(&(get_cctx(peer)->stats_lock));
 
-	return peer_duplicate;
+	return peer_obj;
 }
 
 void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *flow)
@@ -172,6 +181,7 @@ void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *
 	stats_container->stats.receiver_flow.peers = calloc(flow->peer_lst_len, sizeof(struct rist_stats_receiver_peer));
 
 	cJSON *stats = cJSON_CreateObject();
+	cJSON_AddNumberToObject(stats, "schema_version", RIST_STATS_JSON_SCHEMA_VERSION);
 	cJSON *stats_obj = cJSON_AddObjectToObject(stats, "receiver-stats");
 	cJSON *flow_obj = cJSON_AddObjectToObject(stats_obj, "flowinstant");
 	cJSON_AddNumberToObject(flow_obj, "flow_id", flow->flow_id);

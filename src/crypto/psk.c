@@ -88,28 +88,21 @@ static void _librist_crypto_aes_key(struct rist_key *key)
     mbedtls_md_context_t sha_ctx;
     const mbedtls_md_info_t *info_sha;
     int ret = -1;
-    /* Setup the hash/HMAC function, for the PBKDF2 function. */
     mbedtls_md_init(&sha_ctx);
     info_sha = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (info_sha == NULL) {
-            // rist_log_priv(cctx, RIST_LOG_ERROR, "Failed to setup Mbed TLS
-            // hash info\n");
-    }
+    if (info_sha == NULL)
+        goto fail;
 
     ret = mbedtls_md_setup(&sha_ctx, info_sha, 1);
-    if (ret != 0) {
-            // rist_log_priv(cctx, RIST_LOG_ERROR, "Failed to setup Mbed TLS MD
-            // ctx");
-    }
+    if (ret != 0)
+        goto fail;
 
     ret = mbedtls_pkcs5_pbkdf2_hmac(
         &sha_ctx, (const unsigned char *)key->password, key->password_len,
         key->gre_nonce, sizeof(key->gre_nonce),
         RIST_PBKDF2_HMAC_SHA256_ITERATIONS, key->key_size / 8, aes_key);
-    if (ret != 0) {
-            // rist_log_priv(cctx, RIST_LOG_ERROR, "Mbed TLS pbkdf2 function
-            // failed\n");
-    }
+    if (ret != 0)
+        goto fail;
     mbedtls_md_free(&sha_ctx);
 #elif HAVE_NETTLE
     nettle_pbkdf2_hmac_sha256(key->password_len,(const uint8_t*)key->password,
@@ -149,6 +142,15 @@ static void _librist_crypto_aes_key(struct rist_key *key)
     aes_key_setup(aes_key, key->aes_key_sched, key->key_size);
 #endif
     key->used_times = 0;
+    return;
+#if HAVE_MBEDTLS
+fail:
+    mbedtls_md_free(&sha_ctx);
+    /* Leave any prior key install in place but force the lockout flag so we
+     * don't run AES-CTR with whatever happened to be on the stack. */
+    key->bad_decryption = true;
+    return;
+#endif
 }
 
 //This doesn't really belong here (not PSK related), but since all other crypto interop stuff is here it goes in here..
@@ -170,10 +172,16 @@ void _librist_crypto_aes_ctr(const uint8_t key[], int key_size, uint8_t iv[], co
 		nettle_aes256_set_encrypt_key(&aes_ctx.u.ctx256, key);
 		f = (nettle_cipher_func *)nettle_aes256_encrypt;
 		break;
-	case 128:
-		nettle_aes128_set_encrypt_key(&aes_ctx.u.ctx128, key);
+	case 192:
+		nettle_aes192_set_encrypt_key(&aes_ctx.u.ctx192, key);
 		f = (nettle_cipher_func *)nettle_aes192_encrypt;
 		break;
+	case 128:
+		nettle_aes128_set_encrypt_key(&aes_ctx.u.ctx128, key);
+		f = (nettle_cipher_func *)nettle_aes128_encrypt;
+		break;
+	default:
+		return;
 	}
 	nettle_ctr_crypt(&aes_ctx.u, f, AES_BLOCK_SIZE, iv, payload_len, outbuf, inbuf);
 #else
@@ -190,16 +198,17 @@ static void _librist_crypto_psk_aes_ctr(struct rist_key *key, const uint8_t inbu
 #elif HAVE_NETTLE
 	nettle_cipher_func *f;
 	switch(key->key_size) {
-	case 256:
-		f = (nettle_cipher_func *)nettle_aes256_encrypt;
+	case 128:
+		f = (nettle_cipher_func *)nettle_aes128_encrypt;
 		break;
 	case 192:
 		f = (nettle_cipher_func *)nettle_aes192_encrypt;
 		break;
-	case 128:
-		RIST_FALLTHROUGH;
+	case 256:
+		f = (nettle_cipher_func *)nettle_aes256_encrypt;
+		break;
 	default:
-		f = (nettle_cipher_func *)nettle_aes128_encrypt;
+		return;
 	}
 	nettle_ctr_crypt(&key->nettle_ctx.u, f, AES_BLOCK_SIZE, key->iv,payload_len, outbuf, inbuf);
 #elif defined(LINUX_CRYPTO)
@@ -222,10 +231,29 @@ static void _librist_crypto_psk_prepare_iv(struct rist_key *key, uint8_t gre_ver
 }
 
 static void _librist_crypto_psk_generate_nonce(struct rist_key *key) {
-	uint32_t nonce_val;
-	do {
-		nonce_val = prand_u32();
-	} while (!nonce_val);
+	/* Fail-closed CSPRNG: on failure, mark the key locked so encrypt/decrypt
+	 * short-circuit instead of running AES under a predictable nonce. */
+	uint32_t nonce_val = 0;
+	for (int attempts = 0; attempts < 8; attempts++) {
+		if (_librist_crypto_random_u32(&nonce_val) != 0) {
+			rist_log_priv3(RIST_LOG_ERROR,
+				"PSK nonce generation: CSPRNG unavailable, "
+				"PSK encrypt/decrypt locked out until passphrase rotation\n");
+			key->csprng_failed = true;
+			key->bad_decryption = true;
+			return;
+		}
+		if (nonce_val != 0)
+			break;
+	}
+	if (nonce_val == 0) {
+		/* 8 zeros in a row from a working CSPRNG is 2^-256; treat as malfunction. */
+		rist_log_priv3(RIST_LOG_ERROR,
+			"PSK nonce generation: CSPRNG returned only zeros, locking out\n");
+		key->csprng_failed = true;
+		key->bad_decryption = true;
+		return;
+	}
 
 	memcpy(key->gre_nonce, &nonce_val, sizeof(key->gre_nonce));
 
@@ -236,19 +264,28 @@ static void _librist_crypto_psk_generate_nonce(struct rist_key *key) {
 
 void _librist_crypto_psk_decrypt(struct rist_key *key, uint8_t nonce[4], uint32_t seq_nbe, uint8_t gre_version, const uint8_t inbuf[], uint8_t outbuf[], size_t payload_len)
 {
-	uint32_t nonce_val = *((uint32_t *)nonce);
-    if (!nonce_val)
+	uint32_t nonce_val;
+	memcpy(&nonce_val, nonce, sizeof(nonce_val));
+    // A zero nonce never comes from a legitimate sender; refuse to decrypt
+    if (!nonce_val) {
+        key->bad_decryption = true;
         return;
+    }
 
     if (memcmp(nonce, key->gre_nonce, sizeof(key->gre_nonce)) != 0) {
+        /* Skip PBKDF2 + rekey while locked out. */
+        if (key->bad_decryption)
+            return;
         memcpy(key->gre_nonce, nonce, sizeof(key->gre_nonce));
         _librist_crypto_aes_key(key);
         key->bad_decryption = false;
         key->bad_count = 0;
     }
 
-    if (key->used_times > RIST_AES_KEY_REUSE_TIMES)
+    if (key->used_times > RIST_AES_KEY_REUSE_TIMES) {
+        key->bad_decryption = true;
         return;
+    }
 
     _librist_crypto_psk_prepare_iv(key, gre_version, seq_nbe);
 #if HAVE_MBEDTLS
@@ -260,10 +297,19 @@ void _librist_crypto_psk_decrypt(struct rist_key *key, uint8_t nonce[4], uint32_
 
 void _librist_crypto_psk_encrypt(struct rist_key *key, uint32_t seq_nbe, uint8_t gre_version,const uint8_t inbuf[], uint8_t outbuf[], size_t payload_len)
 {
-    uint32_t nonce_val = *((uint32_t *)key->gre_nonce);
+    uint32_t nonce_val;
+    memcpy(&nonce_val, key->gre_nonce, sizeof(nonce_val));
     if (!nonce_val || (key->used_times +1) > RIST_AES_KEY_REUSE_TIMES || (key->key_rotation > 0 && key->used_times >= key->key_rotation)) {
         _librist_crypto_psk_generate_nonce(key);
+        if (key->csprng_failed) {
+            memset(outbuf, 0, payload_len);
+            return;
+        }
         _librist_crypto_aes_key(key);
+    }
+    if (key->csprng_failed) {
+        memset(outbuf, 0, payload_len);
+        return;
     }
     _librist_crypto_psk_prepare_iv(key, gre_version, seq_nbe);
 #if HAVE_MBEDTLS
@@ -282,6 +328,7 @@ int _librist_crypto_psk_set_passphrase(struct rist_key *key, const uint8_t *pass
 	memcpy(key->password, passsphrase, passphrase_len);
 	key->password_len = passphrase_len;
 	key->used_times = 0;
+	key->csprng_failed = false; /* fresh passphrase, retry CSPRNG */
 	_librist_crypto_psk_generate_nonce(key);
 	_librist_crypto_aes_key(key);
 	return 0;
