@@ -41,6 +41,12 @@ struct rist_peer;
 #define RIST_DEFAULT_SESSION_TIMEOUT (2000)
 #define RIST_DEFAULT_KEEPALIVE_INTERVAL (1000)
 #define RIST_DEFAULT_TIMING_MODE RIST_TIMING_MODE_SOURCE
+#define RIST_DEFAULT_RECOVERY_PRIORITY (0)
+
+/* Special value for rist_peer_config.weight: a peer configured with this
+ * weight receives a duplicate of every packet instead of taking part in
+ * the weighted load-balancing rotation. */
+#define RIST_PEER_WEIGHT_DUPLICATE (0)
 
 enum rist_timing_mode
 {
@@ -63,7 +69,21 @@ enum rist_congestion_control_mode
 	RIST_CONGESTION_CONTROL_MODE_AGGRESSIVE = 2
 };
 
-#define RIST_PEER_CONFIG_VERSION (0)
+enum librist_split_mode
+{
+	LIBRIST_SPLIT_MODE_OFF  = 0,
+	LIBRIST_SPLIT_MODE_AUTO = 1,
+	LIBRIST_SPLIT_MODE_HALF = 2,
+};
+
+enum librist_merge_mode
+{
+	LIBRIST_MERGE_MODE_OFF   = 0,
+	LIBRIST_MERGE_MODE_PAIRS = 1,
+	LIBRIST_MERGE_MODE_AUTO  = 2,
+};
+
+#define RIST_PEER_CONFIG_VERSION (5)
 
 struct rist_peer_config
 {
@@ -93,7 +113,7 @@ struct rist_peer_config
 	uint32_t recovery_rtt_min; /* ms */
 	uint32_t recovery_rtt_max; /* ms */
 
-	/* Load balancing weight (use 0 for duplication) */
+	/* Load balancing weight (use RIST_PEER_WEIGHT_DUPLICATE for duplication) */
 	uint32_t weight;
 
 	/* Encryption */
@@ -118,14 +138,85 @@ struct rist_peer_config
 	enum rist_timing_mode timing_mode;
 	char srp_username[RIST_MAX_STRING_LONG];
 	char srp_password[RIST_MAX_STRING_LONG];
+
+	uint32_t split_mode;      /* enum librist_split_mode (sender) */
+	uint32_t merge_mode;      /* enum librist_merge_mode (receiver) */
+
+	/* Reflector mode: when enabled on a receiver listener, incoming data
+	 * packets are transparently forwarded to all other connected peers
+	 * (one-to-many fan-out).  Disabled by default; enable via URL parameter
+	 * ?reflector=1.  Main Profile only.
+	 *
+	 * Trade-offs vs rist2rist (per-subscriber ARQ relay):
+	 * - No per-subscriber retry buffer: the reflector does not cache
+	 *   data; retransmissions rely entirely on the publisher's buffer.
+	 * - Retransmissions fan out to ALL subscribers, not just the one
+	 *   that NACKed — bandwidth cost scales with subscriber count.
+	 * - Recovery RTT ~ RTT(sub<->reflector) + RTT(reflector<->pub),
+	 *   roughly 2x a direct connection.
+	 * - No per-subscriber congestion control or stats: all NACKs
+	 *   appear to the publisher as coming from a single peer.
+	 *
+	 * Best suited for low subscriber counts with clean last-mile links.
+	 * For high fan-out, lossy last-mile, or per-subscriber buffer
+	 * tuning, use rist2rist instead. */
+	int reflector;
+
+	/* Multicast TTL / hop limit (0 = platform default, typically 1) */
+	uint32_t multicast_ttl;
+
+	/* SSM source address for IGMPv3 source-specific multicast (empty = ASM) */
+	char multicast_source[RIST_MAX_STRING_LONG];
+
+	/* Local UDP port for caller (non-listening) peers.
+	 * 0 = ephemeral (OS-assigned), non-zero = bind to this port.
+	 * Not all platforms support binding caller sockets to a fixed port. */
+	uint16_t local_port;
+
+	int srp_compat_legacy;    /* 0 = RFC 5054 PAD (default), 1 = pre-0.2.16 unpadded */
+
+	/* Wire profile parsed from ?profile=.  Test profile_set first:
+	 * profile == RIST_PROFILE_SIMPLE on a zero-initialised config is
+	 * indistinguishable from "value not provided". */
+	enum rist_profile profile;
+	int profile_set;
+
+	/* Retransmission (NACK) routing preference for the receiver.
+	 * When a flow is carried by more than one RTCP-capable peer, the
+	 * receiver sends each NACK to the eligible peer with the highest
+	 * recovery_priority (ties broken by lowest measured RTT).  0
+	 * (default) preserves the legacy behaviour of selecting the
+	 * lowest-RTT eligible peer regardless of priority.  Set this >0 on
+	 * the peer that holds the retransmission buffer when a lower-RTT
+	 * peer carrying the same flow cannot answer NACKs (e.g. a
+	 * duplicate/relay feed with no retransmit cache). */
+	uint32_t recovery_priority;
 };
+
+/**
+ * @brief Populate a preallocated peer_config structure with library default values (versioned)
+ *
+ * @return 0 on success or non-zero on error.
+ */
+RIST_API int rist_peer_config_defaults_set_versioned(struct rist_peer_config *peer_config, int version);
 
 /**
  * @brief Populate a preallocated peer_config structure with library default values
  *
  * @return 0 on success or non-zero on error.
  */
+#ifdef LIBRIST_INTERNAL
 RIST_API int rist_peer_config_defaults_set(struct rist_peer_config *peer_config);
+#else
+#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L)
+static inline int rist_peer_config_defaults_set(struct rist_peer_config *peer_config) {
+	return rist_peer_config_defaults_set_versioned(peer_config, RIST_PEER_CONFIG_VERSION);
+}
+#else
+#define rist_peer_config_defaults_set(peer_config) \
+	rist_peer_config_defaults_set_versioned((peer_config), RIST_PEER_CONFIG_VERSION)
+#endif
+#endif
 
 /**
  * @brief Parses rist url for peer config data (encryption, compression, etc)
@@ -154,6 +245,11 @@ RIST_API int rist_peer_config_free2(struct rist_peer_config **peer_config);
  * @brief Add a peer to the RIST session
  *
  * One sender can send data to multiple peers.
+ *
+ * If config->profile_set is non-zero (version >= 4), the call may
+ * change the context wire profile to config->profile when invoked
+ * before rist_start() and before any other peer has fixed it.  Once
+ * fixed, any later call whose ?profile= disagrees returns -1.
  *
  * @param ctx RIST context
  * @param[out] peer Store the new peer pointer

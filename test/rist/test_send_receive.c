@@ -8,6 +8,7 @@
 #include "librist/librist.h"
 #include "rist-private.h"
 #include <stdatomic.h>
+#include <inttypes.h>
 #include "mpegts.h"
 #include "endian-shim.h"
 
@@ -17,6 +18,11 @@
 
 atomic_ulong failed;
 atomic_ulong stop;
+atomic_ulong flow_attr_received;
+int use_seq = 0;
+int check_flow_attr = 0;
+int has_loss = 0;
+#define USE_SEQ_START 1000
 
 struct rist_logging_settings *logging_settings_sender = NULL;
 struct rist_logging_settings *logging_settings_receiver = NULL;
@@ -28,15 +34,19 @@ int log_callback(void *arg, int level, const char *msg) {
         fprintf(stdout, "[%s] %s",(char*)arg, msg);
     if (level <= RIST_LOG_ERROR) {
 	fprintf(stdout, "[%s] [ERROR] %s", (char* )arg, msg);
-	/* This SHOULD fail the test, I've disabled it so that we pass the encryption tests.
-	   in the encryption test we are hitting a condition where the linux crypto stuff seems
-	   to not be initialized quickly enough, and we print error messages because decryption
-	   is not working correctly, however this is an intermittent issue and solves itself.
-	   Furthermore it is not triggered by the CLI tools.
-	   This should be investigated and fixed */
-        atomic_store(&failed, 1);
-        atomic_store(&stop, 1);
+	if (!has_loss) {
+	    atomic_store(&failed, 1);
+	    atomic_store(&stop, 1);
+	}
     }
+    return 0;
+}
+
+static int flow_attr_callback(void *arg, struct rist_peer *peer, const char *json, size_t json_len) {
+    (void)arg;
+    (void)peer;
+    if (json && json_len > 0)
+        atomic_fetch_add(&flow_attr_received, 1);
     return 0;
 }
 
@@ -70,7 +80,10 @@ struct rist_ctx *setup_rist_receiver(int profile, const char *url) {
     }
 #endif
     free((void *)peer_config);
-	if (rist_start(ctx) == -1) {
+    if (check_flow_attr) {
+        rist_receiver_flow_attr_callback_set(ctx, flow_attr_callback, NULL);
+    }
+    if (rist_start(ctx) == -1) {
 		rist_log(logging_settings_receiver, RIST_LOG_ERROR, "Could not start rist sender\n");
 		return NULL;
 	}
@@ -143,10 +156,15 @@ static PTHREAD_START_FUNC(send_data, arg) {
             else {
                 hdr->flags1 = htobe16(0x1111);
             }
-            sprintf(&buffer[offset+sizeof(*hdr)+1], "DEADBEAF TEST PACKET #%i-%i", send_counter, ts);
+            int pkt_id = use_seq ? (send_counter + USE_SEQ_START) : send_counter;
+            sprintf(&buffer[offset+sizeof(*hdr)+1], "DEADBEAF TEST PACKET #%i-%i", pkt_id, ts);
         }
         data.payload = &buffer;
         data.payload_len = 188 * random_num;
+        if (use_seq) {
+            data.flags = RIST_DATA_FLAGS_USE_SEQ;
+            data.seq = (uint64_t)(send_counter + USE_SEQ_START);
+        }
         int ret = rist_sender_data_write(rist_sender, &data);
         if (ret < 0) {
             fprintf(stderr, "Failed to send test packet with error code %d!\n", ret);
@@ -179,24 +197,30 @@ static PTHREAD_START_FUNC(send_data, arg) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 5 && argc != 6) {
+    if (argc < 5 || argc > 8) {
         return 99;
     }
     int profile = atoi(argv[1]);
     char *url1 = strdup(argv[2]);
     char *url2 = strdup(argv[3]);
     int losspercent = atoi(argv[4]) * 10;
+    has_loss = losspercent > 0;
     int npd = 0;
     int ret = 0;
 
-    if (argc == 6)
+    if (argc >= 6)
         npd = atoi(argv[5]);
+    if (argc >= 7)
+        use_seq = atoi(argv[6]);
+    if (argc >= 8)
+        check_flow_attr = atoi(argv[7]);
 
     struct rist_ctx *receiver_ctx = NULL;
     struct rist_ctx *sender_ctx = NULL;
 
     atomic_init(&failed, 0);
     atomic_init(&stop, 0);
+    atomic_init(&flow_attr_received, 0);
 
 
     fprintf(stdout, "Testing profile %i with receiver url %s and sender url %s and losspercentage: %i\n", profile, url1, url2, losspercent);
@@ -249,6 +273,13 @@ int main(int argc, char *argv[]) {
             if (!got_first) {
                 receive_count = (int)b->seq;
 				got_first = true;
+				if (use_seq && (int)b->seq < USE_SEQ_START) {
+					fprintf(stderr, "USE_SEQ: first seq %"PRIu64" < expected start %d, "
+					        "sender-supplied seq was not preserved\n",
+					        b->seq, USE_SEQ_START);
+					atomic_store(&failed, 1);
+					atomic_store(&stop, 1);
+				}
 			}
             // Check entire mpegts structure
             int tsindex = (int)(b->payload_len / 188);
@@ -284,8 +315,21 @@ int main(int argc, char *argv[]) {
             rist_receiver_data_block_free2((struct rist_data_block **const)&b);
         }
     }
-	if (!got_first || receive_count < 12500)
+	int expected = 16000 * (1000 - losspercent) / 1000;
+	int min_receive = (expected < 12500) ? expected * 5 / 6 : 12500;
+	if (!got_first || receive_count < min_receive) {
+		fprintf(stderr, "Received %d packets, minimum required %d\n",
+			receive_count, min_receive);
 		atomic_store(&failed, 1);
+	}
+	if (check_flow_attr) {
+		unsigned long fa_count = atomic_load(&flow_attr_received);
+		fprintf(stdout, "Flow attributes received: %lu\n", fa_count);
+		if (fa_count == 0) {
+			fprintf(stderr, "FAIL: expected at least one flow attribute callback\n");
+			atomic_store(&failed, 1);
+		}
+	}
 	if (atomic_load(&failed))
 		ret = 1;
 	pthread_join(send_loop, NULL);

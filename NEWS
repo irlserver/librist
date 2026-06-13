@@ -2,7 +2,314 @@ librist - Reliable Internet Stream Transport
 ============================================
 
 A library implementing the Video Services Forum (VSF) Technical
-Recommendations TR-06-1 (Simple Profile) and TR-06-2 (Main Profile).
+Recommendations TR-06-1 (Simple Profile), TR-06-2 (Main Profile),
+and TR-06-3 (Advanced Profile).
+
+
+Changes for 0.2.18 (pre-release):
+---------------------------------
+
+ABI/API:
+  - RIST_PEER_CONFIG_VERSION bumped from 2 to 3 (one new field:
+    srp_compat_legacy).  Existing zero-initialised peer configs
+    continue to work; the new field defaults to 0 (spec-compliant).
+  - RIST_PEER_CONFIG_VERSION bumped from 3 to 4 (two new fields:
+    profile + profile_set, populated by the ?profile= URL parameter).
+    rist_peer_config_defaults_set() initialises both to safe defaults
+    (profile = RIST_DEFAULT_PROFILE, profile_set = 0).  Existing
+    zero-initialised configs keep their pre-bump behaviour.
+  - New rist_peer_config_defaults_set_versioned(cfg, version) initialises
+    only the fields defined at or below the given RIST_PEER_CONFIG_VERSION.
+    rist_peer_config_defaults_set() is now a static inline wrapper (peer.h)
+    that forwards the caller's compiled RIST_PEER_CONFIG_VERSION, so a
+    recompiled caller initialises exactly the fields its struct contains.
+    The exported rist_peer_config_defaults_set() symbol is retained for
+    binaries linked against an earlier library; it assumes version 0 and
+    sets only the baseline fields present in every struct revision.  Such
+    binaries must zero-initialise their config before the call: fields
+    added in version 1+ (split_mode, merge_mode, profile, profile_set)
+    are left untouched.
+  - RIST_PEER_CONFIG_VERSION bumped from 4 to 5 (one new field:
+    recovery_priority, populated by the ?recovery-priority= URL
+    parameter).  rist_peer_config_defaults_set_versioned() initialises
+    it to 0 for callers compiled against version 5 or later; zero-
+    initialised configs and callers built against an earlier version
+    keep the legacy NACK-routing behaviour.
+  - New public macro RIST_PEER_WEIGHT_DUPLICATE (0) names the
+    rist_peer_config.weight sentinel that selects packet duplication
+    instead of weighted load-balancing.  Value unchanged.
+
+Features:
+  - Per-peer retransmission routing: the new ?recovery-priority=<n>
+    peer URL parameter (rist_peer_config.recovery_priority) lets a
+    receiver direct NACKs to a chosen peer when a flow is carried by
+    more than one RTCP-capable peer.  Each NACK group is sent to the
+    eligible peer with the highest recovery_priority, ties broken by
+    lowest RTT.  The default of 0 on every peer preserves the prior
+    lowest-RTT selection.  Useful when the lowest-RTT peer cannot
+    answer NACKs (e.g. a duplicate/relay feed with no retransmit
+    buffer) while a higher-RTT peer holds the retransmission buffer.
+
+Bug Fixes:
+  - ?profile=0|1|2 in a peer URL (0=Simple, 1=Main, 2=Advanced) now
+    overrides the wire profile of the context that owns the peer.
+    rist_parse_address2 parses the value into rist_peer_config; on the
+    first matching peer added before rist_start(), rist_peer_create
+    mutates the context profile and lazily initialises the Advanced
+    profile state when upgrading to Advanced.  Subsequent peers must
+    request the same profile (or omit the parameter); rist_peer_create
+    returns -1 with a WARN once the context profile is locked (after
+    rist_start() or a prior peer fixed it).  Any consumer that passes
+    URLs through rist_parse_address2 + rist_peer_create now gets the
+    URL-driven profile selection with no further integration work.
+  - Fixed a use-after-free in the global logger when an application frees
+    its rist_logging_settings, either directly via
+    rist_logging_settings_free2() or by destroying a context that embeds
+    them (as FFmpeg does), while the global logger still references that
+    callback and argument.  The global logging settings are now cleared
+    when the matching settings are freed, so logs emitted afterwards (for
+    example from background threads on a rapid close/reopen) no longer
+    call into freed memory.
+  - rist_peer_config_defaults_set() no longer writes past the end of a
+    peer config supplied by a binary compiled against an older
+    RIST_PEER_CONFIG_VERSION, and parse_url_options() / store_peer_settings()
+    no longer touch version-specific fields unless peer_config->version is
+    high enough: reflector, multicast_ttl, multicast_source and local_port
+    require version >= 2; srp_compat_legacy requires version >= 3.
+  - Windows XP support restored: rist_transport_poll() now uses
+    select() via the existing contrib/poll_win.c shim instead of
+    WSAPoll() (Vista+ only).  Regression introduced in 0.2.17.
+  - rist_peer_recv() now accepts both canonical numeric EAGAIN errno
+    values (11 and 35) when a custom transport_ops backend signals
+    "no data ready", protecting cross-compile environments where the
+    EAGAIN macro can resolve differently across translation units.
+  - librist/transport.h now defines ssize_t on Windows (#214), so
+    downstream consumers no longer have to provide their own typedef.
+  - Prometheus exporter: counter rows in multiple_metric_datapoints
+    mode now have a space between the value and the timestamp.
+    Affected every existing _total row.
+  - Prometheus exporter: in single_stat_point mode, the displayed
+    value no longer freezes at the first callback and silently
+    drops every subsequent sample.  Affected all receiver-flow,
+    sender-peer, and per-peer-receiver gauges.
+  - Receiver flow stats: bitrate, bitrate_retries, bitrate_rejected
+    and bitrate_ts_nulls now decay to zero when the corresponding
+    traffic stops, instead of remaining frozen at the last value
+    computed while traffic was still flowing (#217).
+
+SRP interoperability:
+  - 0.2.16 made TLS-SRP RFC 5054 / TR-06-2 compliant by adding the
+    PAD operation to the u and k hash inputs.  As a side effect,
+    SRP-authenticated peers running 0.2.15 or earlier (which omitted
+    the PAD) will not handshake with 0.2.16+.  Upgrading both ends
+    to 0.2.16+ remains the recommended fix.
+  - New URL parameter for transitional interop:
+        ?srp-compat=1
+    On both ends of the SRP exchange, this opts the SRP wire format
+    back into the pre-0.2.16 unpadded form.  Must be set on BOTH
+    sides; mixed configuration will still fail.  An explicit WARN
+    is logged on startup when the option is active.  Intended only
+    as an escape hatch while older deployments are upgraded.
+  - When an SRP handshake fails, the authenticator (and the client
+    on M2 mismatch) now emits a single INFO hint pointing at the
+    srp-compat=1 escape hatch.  The hint is advisory only —
+    the SRP-6a transcript binds M1 to the authenticator's wire-mode
+    B, so there is no purely-local way to distinguish "wrong
+    password" from "peer is on the other wire format" once the
+    handshake has reached M1.  No action required for non-SRP
+    deployments.
+
+CI / Test Coverage:
+  - srp_unit_test now runs in test-ubuntu.  cmocka is sourced via a
+    new subprojects/cmocka.wrap (WrapDB 1.1.8-1) so the test builds
+    even on runner images that do not ship libcmocka-dev, closing the
+    silent-skip gap that hid the SRP fixture drift reported in #215.
+    Test fixtures regenerated for the PAD-compliant SRP exchange
+    against the 2048-bit RFC 5054 group.  Added four end-to-end tests
+    covering both PAD and legacy modes plus the two cross-mode failure
+    cases.
+
+Tools:
+  - ristsender: new --blind-send option.  Decouples the sender from
+    RIST peer state — multicast input groups are joined immediately
+    and incoming UDP data is written to the RIST context regardless
+    of whether any output peer has connected.  Intended for
+    fire-and-forget broadcast topologies (multicast output in
+    simple/main/advanced profile, or ristsender used as a relay /
+    fan-out in front of non-RIST consumers).
+  - Prometheus exporter: new per-peer receiver metric block
+    rist_receiver_peer_* with labels {peer_id, peer_url, flow_id,
+    receiver_id}, mirroring rist_sender_peer_*.  Auto-registered
+    from rist_stats_receiver_flow.peers[].
+  - Prometheus exporter: new client-flow gauge
+    rist_client_flow_avg_buffer_time_seconds reporting the dynamic
+    receiver buffer fill level (sourced from avg_buffer_time in
+    rist_stats_receiver_flow, converted from ms to seconds).
+
+
+Changes for 0.2.17:
+---------------------------------
+
+ABI/API:
+  - ABI version 12:0:8 (soversion 4, binary-compatible with 0.2.15)
+  - API version 4.9.0 (new features, backwards-compatible)
+  - RIST_STATS_VERSION bumped from 1 to 2 (new byte-counter fields
+    appended to rist_stats_sender_peer, rist_stats_receiver_peer,
+    and rist_stats_receiver_flow).
+  - RIST_STATS_JSON_SCHEMA_VERSION bumped from 2 to 3 (new fields:
+    sent_bytes, retransmitted_bytes, received_bytes).
+  - RIST_PEER_CONFIG_VERSION bumped from 1 to 2 (new fields:
+    multicast_ttl, multicast_source, local_port).
+
+New Features:
+
+  Pluggable Transport Abstraction (transport.h):
+  - New rist_transport_ops vtable replaces direct socket syscalls with
+    user-supplied callbacks (sendto, recvfrom, socket, bind, close,
+    setsockopt, poll).  Enables librist on non-POSIX platforms such as
+    WebAssembly/WebTransport, userspace network stacks, or unit-test
+    harnesses.
+  - New rist_transport_set() installs custom transport ops on a context.
+  - Default ops delegate to real syscalls so existing behaviour is
+    unchanged.
+
+  Packet Split / Merge (peer.h):
+  - Sender: split each application write into an even/odd sequence pair
+    when the payload exceeds half the path MTU.  Controlled by
+    split_mode in rist_peer_config (off, auto, half).
+  - Receiver: transparently merge split pairs before delivery.
+    Controlled by merge_mode in rist_peer_config (off, pairs, auto).
+  - Keepalive advertises split capability via the L bit; receiver
+    auto-detects when the sender supports it.
+  - URL parameters: ?split=off|auto|half, ?merge=off|pairs|auto.
+  - Split/merge counters surfaced in JSON statistics.
+  - risttunnel auto-enables split+merge when MTU < 1400.
+
+  Advanced Profile (VSF TR-06-3):
+  - Wire format and protocol integration for the Advanced Profile as
+    defined by VSF TR-06-3.
+  - Native control plane: Keep-Alive with I bit (CI=0x8000), RTT Echo
+    Request/Response (CI=0x0010/0x0011), NACK Bitmask (CI=0x0000),
+    NACK Range (CI=0x0001), Unsupported Response (CI=0x8020).
+  - Full 32-bit sequence number indexing (expanded seq_index array).
+  - Type 8 GRE-over-AP encapsulation for Section 9 interoperability.
+  - PSK encryption mode 1 (AES-CTR, Main Profile compatible) with
+    per-packet Nonce/IV in the AP header.
+  - Future Nonce Announcement (CI=0x8011) for zero-latency key rotation.
+  - SRP (Secure Remote Password) passphrase exchange, reusing the EAP-SRP
+    state machine from Main Profile over Type 8 encapsulated EAPOL.
+  - Flow ID field (I flag): virt_dst_port and virt_src_port map to/from
+    the AP Outer/Inner Flow ID hierarchy on the wire.
+  - LZ4 payload compression (LPC=1): sender compresses before encryption,
+    receiver decompresses after decryption.  Controlled by the existing
+    ?compression=1 URL parameter; receiver auto-detects via the LPC field.
+    Bundled LZ4 library in contrib/lz4/ with system-library fallback.
+  - Flow Attribute messages (CI=0x8001): sender periodically transmits
+    session/flow metadata as JSON.  New receiver callback API
+    (rist_receiver_flow_attr_callback_set) delivers parsed attributes
+    to the application.
+  - Baseline.Direct conformance for single-flow encrypted point-to-point
+    RIST transport with ARQ.
+  - 22 integration tests (basic, packet loss, encryption, mismatch,
+    flow-id, lz4, lz4+encryption, flow-attr, SRP auth).
+  - 187 unit tests (wire format, timestamp, seq_index, Type 8, PSK modes,
+    Flow ID mapping, LZ4 roundtrip, flow-attr control roundtrip).
+
+  Per-byte statistics (#174):
+  - Sender stats now include sent_bytes and retransmitted_bytes counters
+    in both the C struct (rist_stats_sender_peer) and JSON output.
+  - Receiver flow stats now include received_bytes in the C struct
+    (rist_stats_receiver_flow) and JSON output.
+  - Per-peer receiver stats include received_bytes.
+
+  Multicast enhancements (#112):
+  - Configurable multicast TTL via ?ttl=N URL parameter (1-255).
+    New udpsocket_set_mcast_ttl() public API.
+  - IGMPv3 Source-Specific Multicast (SSM) support via ?source=IP
+    URL parameter.  Uses IP_ADD_SOURCE_MEMBERSHIP / MCAST_JOIN_SOURCE_GROUP.
+  - IPv6 multicast join support (previously only IPv4 was implemented).
+  - New udpsocket_open_bind_mcast() with TTL and SSM source parameters.
+  - udpsocket_join_mcast_group() now public API, supports IPv6 and SSM.
+
+  Configurable local port for caller peers (#158):
+  - New ?local-port=N URL parameter to bind caller (non-listening) peers
+    to a specific local UDP port instead of using an ephemeral port.
+  - New local_port field in rist_peer_config.
+
+  Deferred multicast join in ristsender (#85):
+  - When ristsender's input URL is a multicast address, the IGMP join
+    is now deferred until the first RIST peer handshake completes.
+    Prevents receiving multicast traffic before the output path is ready.
+
+  WebAssembly / Emscripten:
+  - TUN device stubs for Emscripten targets.
+  - Meson cross-file (wasm32-emscripten.txt) for WASM builds.
+  - C99 strict-aliasing fix for merge memcpy.
+
+Build:
+  - Bundled mbedTLS upgraded from 2.28.10 (EOL) to 3.6.6 LTS.
+    The bundled tree now compiles as a separate static library with
+    targeted warning suppression, isolating mbedTLS internals from
+    librist's strict compiler flags.  Source compatibility fixes
+    applied for the 2.x -> 3.x API migration (removed _ret suffixes,
+    updated header paths).  System mbedTLS 3.6.x is also fully
+    supported.
+  - Removed unused #include <mbedtls/entropy_poll.h> which broke
+    builds against system mbedTLS >= 3.6 where the header was removed.
+
+Test:
+  - Loss simulation tests no longer abort on transient error log
+    messages.  Under heavy bilateral loss, error-level messages are
+    expected and do not indicate bugs.
+  - Minimum receive threshold for loss tests now scales with the
+    configured loss percentage, giving headroom for ARQ recovery in
+    CI environments with timing jitter.
+
+New features:
+ - Add transparent one-to-many reflector mode (Main Profile only).
+   A receiver listener configured with ?reflector=1 transparently
+   forwards data packets from the publisher (sender) to all subscriber
+   (receiver) peers, and routes NACKs/RTCP from subscribers back to
+   the publisher.  Enables a single-listener fan-out topology without
+   requiring a full sender context on the reflector.
+   Trade-offs vs rist2rist (per-subscriber ARQ relay):
+     * No per-subscriber retry buffer — recovery relies on the
+       publisher's buffer, which may have aged out the packet.
+     * Retransmissions fan out to ALL subscribers, not just the one
+       that NACKed — bandwidth scales with subscriber count.
+     * Recovery RTT is roughly 2x a direct connection.
+     * No per-subscriber congestion control or statistics.
+   Best suited for low subscriber counts with clean last-mile links.
+   For high fan-out or lossy last-mile, use rist2rist instead.
+   (contributed by RossWang)
+
+RTCP/NACK:
+ - Fix OOB read in NACK_FMT_SEQEXT handler: the RTCP feedback loop
+   validated only 4 bytes per record, but the seqext struct reads
+   seq_msb at offset 12.  A crafted datagram with a short trailing
+   record could read up to 12 bytes past the allocation.  Add a
+   per-handler minimum-length check matching the adjacent ECHO branches.
+ - Fix OOB read and log-disclosure in rist_sender_recv_nack: the NACK
+   range handler read the 4-byte name field at offset 8 with only an
+   8-byte minimum guarantee, and logged it with %s (unbounded read to
+   next NUL).  Add a sizeof guard and use %.4s.
+
+Log:
+ - Lower log level for harmless cross-role NACK/data packets from
+   ERROR/WARN to DEBUG to reduce log noise in reflector topologies.
+
+EAP/SRP:
+ - Fix EAPOL-Start body length field: the packet declared a 4-byte body
+   (sizeof(eapol_hdr)) when the correct value is 0 (EAPOL-Start carries
+   no body).  This bug was dormant until the bounds-check tightening in
+   0.2.15 started correctly rejecting oversized body declarations,
+   which broke every SRP handshake.  SRP authentication has been
+   non-functional since 0.2.15.
+ - Fix off-by-one in eap_srp_send_password bounds check: the limit did
+   not account for the 1-byte flags field before the ciphertext, so a
+   maximum-length password would write 1 byte past the stack buffer.
+   Not network-reachable (all callers cap at 128 bytes), but worth
+   hardening.
 
 
 Changes for 0.2.16 (pre-release):
@@ -12,8 +319,8 @@ ABI/API:
   - ABI version 10:4:6 (soversion 4, binary-compatible with 0.2.15)
   - API version 4.7.0 (unchanged)
 
-  Maintenance release for 0.2.15. No source or binary changes are
-  required of downstream consumers.
+  Maintenance and security-hardening release for 0.2.15. No source or
+  binary changes are required of downstream consumers.
 
 Bug Fixes:
 
@@ -40,6 +347,15 @@ Bug Fixes:
     Windows version. Without this fix, the 0.2.15 CSPRNG hardening
     refused to start the SRP/AES code paths in those environments
     rather than silently downgrade. Fixes #210.
+  - MSVC builds no longer crash due to stack corruption in atomic
+    operations. The stdatomic compatibility shim hardcoded all
+    operations to a single width, so a 64-bit compare-exchange on a
+    32-bit atomic variable overwrote adjacent stack memory.
+
+  Tools:
+  - ristsender now preserves incoming RTP sequence numbers and
+    timestamps when the --rtp-sequence and --rtp-timestamp options
+    are used. Previously these options had no effect.
 
 Hardening / follow-ups to 0.2.15:
 
@@ -184,6 +500,132 @@ Hardening / follow-ups to 0.2.15:
     BCryptGenRandom, skipping the entropy module entirely on
     Windows. Non-Windows builds still use the normal entropy
     initialisation path.
+
+  Second audit follow-ups (reported by Thomas Guillem):
+
+  EAP-SRP authentication:
+  - EAP passphrase response handler now gates on a matching
+    outstanding request identifier when a solicited passphrase
+    exchange is active.  Previously any post-auth spoofed
+    RESPONSE/PASSWORD_REQUEST_RESPONSE was accepted, allowing a
+    man-on-the-side to hijack a key-rotation exchange.  Unsolicited
+    passphrase pushes (rist_eap_send_passphrase) remain allowed as
+    the payload is encrypted under the SRP session key.
+  - EAP last_identifier is no longer primed in the request prologue
+    before subtype validation.  A spoofed REQUEST with a crafted
+    identifier could prime the FAILURE-identifier gate, allowing a
+    subsequent spoofed FAILURE to latch the peer out.
+  - EAP authenticator initial identifier now comes from the CSPRNG
+    instead of prand_u32, closing an off-path prediction window.
+  - The use_default_2048 flag in EAP SRP challenge processing was
+    hardcoded true, ignoring wire-supplied N/g groups.  Now derived
+    from the actual generator length on the wire.
+  - eap_set_ip_string replaced an unbounded memcpy with strncpy and
+    explicit NUL-termination.
+
+  EAP-SRP / cryptographic primitives:
+  - SRP u and k hash computations now use RFC 5054 PAD: both inputs
+    are zero-extended to the byte length of N before hashing.  The
+    previous unpadded hash produced different values for leading-
+    zero-byte operands, deviating from the specification.  This is a
+    wire-incompatible change with pre-0.2.16 peers using SRP.
+  - SRP M1/M2 verification and client M2 verification now use a
+    constant-time comparison instead of memcmp.
+  - SRP authenticator aborts if the verifier v is zero (session key
+    would not depend on the password).
+  - SRP authenticator aborts if B mod N == 0 (RFC 5054).
+  - SRP authenticator aborts if u == 0 mod N after hashing A||B.
+  - SRP hash return values are now checked; unchecked failures
+    previously left uninitialised buffers in the session transcript.
+  - SRP BIGNUM_EXP_MOD return after computing S is now checked.
+  - SRP client context creation now validates modulus length
+    [128, 1024], generator length [1, N_len], and salt length
+    [1, 64] to cap resource consumption from malformed handshakes.
+  - SRP private exponent size now matches the modulus size instead
+    of a hardcoded 32 bytes, providing full-strength keying for
+    large groups (e.g. NG_8192).
+  - SRP salt generation now uses fixed-size 32-byte raw CSPRNG
+    output copied directly, instead of going through bignum export
+    which strips leading zero bytes and shrinks the effective salt
+    domain.
+
+  Receive path / flow safety:
+  - Use-after-free on flow deletion during rist_receiver_data_read2
+    is fixed.  The flow pointer returned by the lookup function is
+    now validated under flows_lock; the flow's own mutex is acquired
+    before flows_lock is released.  rist_delete_flow unlinks the
+    flow under the same lock before freeing.
+  - rist_receiver_set_output_fifo_size now rejects size == 0 and
+    size > 65536, preventing a zero-modulus OOB on the FIFO ring.
+  - rist_peer_get_cname uses strnlen instead of strlen, bounded by
+    RIST_MAX_STRING_SHORT.
+
+  MPEG-TS null packet handling:
+  - expand_null_packets now bounds-checks each source-packet copy
+    against the original payload length, preventing an information
+    leak of adjacent buffer data when the NPD bit pattern implies
+    more real packets than the payload actually contains.
+  - suppress_null_packets now checks the sync byte of every packet
+    in the block, not just the first.
+
+  SDES / cname / miface:
+  - RTCP SDES writer uses strnlen instead of strlen and zero-fills
+    the padding region explicitly, instead of copying adjacent
+    memory from the source buffer.
+  - All strncpy sites for peer cname and miface (peer_initialize,
+    rist_peer_clone) now have explicit NUL-termination.
+
+  PSK encryption:
+  - PSK key init now uses strnlen and explicit NUL-termination
+    instead of unbounded strlen + memcpy.
+  - PSK key clone now explicitly NUL-terminates the copied password.
+  - PSK decrypt no longer unconditionally clears bad_decryption
+    after rekeying; if _librist_crypto_aes_key set the flag (PBKDF2
+    failure), it stays set so the lockout counter is not reset.
+
+  Sender:
+  - sender_buffer_size growth is now capped at sender_queue_max - 1,
+    preventing unbounded memory growth when packets are too young to
+    delete from the retry queue.
+  - rist_sender_peer_create now calls rist_peer_remove instead of
+    bare free on RTCP-peer creation failure, preventing a dangling
+    pointer in the peer list.
+
+  Miscellaneous:
+  - rist_peer_remove dead store fixed: *next = NULL now executes
+    before the early return on NULL peer.
+  - NACK debug log guarded against zero-length array dereference
+    and uses %zu for size_t.
+  - is_ip_address uses a union of in_addr/in6_addr for the
+    inet_pton destination buffer, fixing an AF_INET6 stack overflow
+    that wrote 16 bytes into a 4-byte sockaddr_in.sin_addr.
+  - rist_new_connection log format strings replaced char[] locals
+    passed via &array with const char * pointers, eliminating
+    strict-aliasing undefined behaviour in the varargs call.
+  - rist_tun_write overflow guard changed from
+    len + UTUN_HEADER_SIZE > sizeof(tmp) to
+    len > sizeof(tmp) - UTUN_HEADER_SIZE, preventing unsigned
+    wraparound when len is near SIZE_MAX.
+
+Community bug reports (gitlab #211, RossWang):
+
+  Receiver flow timing:
+  - Initialize last_packet_ts, time_offset_changed_ts, and
+    time_offset_old when a flow (re)starts.  After a flow reset the
+    stale values from the previous epoch could cause the old-clock
+    fallback to fire, corrupting packet timing and dropping the
+    first few packets.
+
+  OOB dequeue:
+  - rist_oob_dequeue now holds peerlist_lock while walking a
+    listener peer's child list.  A concurrent peer add/remove could
+    free a sibling_next pointer during the walk.
+
+  Note: _librist_peer_match_peer_addr (#211 item 3) also walks the
+  child list without a lock, but cannot use peerlist_lock because the
+  receive callback runs on the same thread that holds it in the
+  protocol loop.  Fixing this requires a per-listener child rwlock or
+  reference counting, planned for a future release.
 
 Test / CI:
   - New unit test (logging_init_order) that exercises the
@@ -841,7 +1283,7 @@ Initial official public release of librist.
 
 Core Features:
   - Full support for VSF TR-06-1 (Simple Profile)
-  - Partial support for VSF TR-06-2 (Main/Advanced Profile):
+  - VSF TR-06-2 (Main Profile):
     * PSK Encryption (AES 128 and 256)
     * Bidirectional connection initiation
     * Multipath support (load balanced or redundant link bonding)

@@ -15,7 +15,7 @@
 #include "cjson/cJSON.h"
 
 /* Bump on any incompatible shape change to the stats JSON payloads. */
-#define RIST_STATS_JSON_SCHEMA_VERSION 2
+#define RIST_STATS_JSON_SCHEMA_VERSION 3
 
 static double round_two_digits(double number)
 {
@@ -48,6 +48,15 @@ void rist_sender_flow_statistics(struct rist_sender *ctx)
 		cJSON_AddNumberToObject(udp_queue_obj, "packets_per_second", 1000 * ctx->sender_queue_size / ctx->sender_queue_timelength);
 	else
 		cJSON_AddNumberToObject(udp_queue_obj, "packets_per_second", 0);
+
+	if (ctx->split_mode != LIBRIST_SPLIT_MODE_OFF) {
+		cJSON *split_obj = cJSON_AddObjectToObject(rist_sender_stats, "split");
+		const char *mode_str = ctx->split_mode == LIBRIST_SPLIT_MODE_AUTO ? "auto" : "half";
+		cJSON_AddStringToObject(split_obj, "mode", mode_str);
+		cJSON_AddNumberToObject(split_obj, "pairs_emitted", (double)ctx->stats_pairs_emitted);
+		cJSON_AddNumberToObject(split_obj, "fallback_not_ts", (double)ctx->stats_split_fallback_not_ts);
+	}
+
 	char *stats_json = cJSON_PrintUnformatted(stats);
 	cJSON_Delete(stats);
 
@@ -111,6 +120,8 @@ cJSON *rist_sender_peer_statistics(struct rist_peer *peer)
 	cJSON_AddNumberToObject(json_stats, "ts_null", (double)peer->stats_sender_instant.ts_null);
 	cJSON_AddNumberToObject(json_stats, "received", (double)peer->stats_sender_instant.received);
 	cJSON_AddNumberToObject(json_stats, "retransmitted", (double)peer->stats_sender_instant.retrans);
+	cJSON_AddNumberToObject(json_stats, "sent_bytes", (double)peer->stats_sender_instant.sent_bytes);
+	cJSON_AddNumberToObject(json_stats, "retransmitted_bytes", (double)peer->stats_sender_instant.retransmitted_bytes);
 	cJSON_AddNumberToObject(json_stats, "bandwidth", (double)bitrate);
 	cJSON_AddNumberToObject(json_stats, "retry_bandwidth", (double)retry_bitrate);
 	cJSON_AddNumberToObject(json_stats, "ts_nulls_bandwidth", (double)ts_nulls_bitrate);
@@ -144,6 +155,8 @@ cJSON *rist_sender_peer_statistics(struct rist_peer *peer)
 	stats_container->stats.sender_peer.retransmitted = peer->stats_sender_instant.retrans;
 	stats_container->stats.sender_peer.quality = Q;
 	stats_container->stats.sender_peer.rtt = avg_rtt / RIST_CLOCK;
+	stats_container->stats.sender_peer.sent_bytes = peer->stats_sender_instant.sent_bytes;
+	stats_container->stats.sender_peer.retransmitted_bytes = peer->stats_sender_instant.retransmitted_bytes;
 
 	if (cctx->stats_callback != NULL)
 		cctx->stats_callback(cctx->stats_callback_argument, stats_container);
@@ -205,8 +218,16 @@ void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *
 		cJSON *peer_obj = cJSON_CreateObject();
 		cJSON_AddNumberToObject(peer_obj, "id", peer->adv_peer_id);
 		cJSON_AddNumberToObject(peer_obj, "dead", peer->dead);
+		/* Listener-mode children have url=NULL; the configured URL
+		 * lives on the parent peer. */
+		const char *peer_url_str = peer->url;
+		if ((peer_url_str == NULL || peer_url_str[0] == '\0') && peer->parent && peer->parent->url) {
+			peer_url_str = peer->parent->url;
+		}
+		cJSON_AddStringToObject(peer_obj, "url", peer_url_str ? peer_url_str : "");
 		cJSON *peer_stats = cJSON_AddObjectToObject(peer_obj, "stats");
 		cJSON_AddNumberToObject(peer_stats, "received_data", (double)peer->stats_receiver_instant.received);
+		cJSON_AddNumberToObject(peer_stats, "received_bytes", (double)peer->stats_receiver_instant.received_bytes);
 		cJSON_AddNumberToObject(peer_stats, "ts_null", (double)peer->stats_receiver_instant.ts_null);	
 		cJSON_AddNumberToObject(peer_stats, "received_rtcp", (double)peer->stats_receiver_instant.received_rtcp);
 		cJSON_AddNumberToObject(peer_stats, "sent_rtcp", (double)peer->stats_receiver_instant.sent_rtcp);
@@ -218,6 +239,7 @@ void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *
 
 		stats_container->stats.receiver_flow.peers[i].peer_id = peer->adv_peer_id;
 		stats_container->stats.receiver_flow.peers[i].received_data = peer->stats_receiver_instant.received;
+		stats_container->stats.receiver_flow.peers[i].received_bytes = peer->stats_receiver_instant.received_bytes;
 		stats_container->stats.receiver_flow.peers[i].received_rtcp = peer->stats_receiver_instant.received_rtcp;
 		stats_container->stats.receiver_flow.peers[i].sent_rtcp = peer->stats_receiver_instant.sent_rtcp;
 		stats_container->stats.receiver_flow.peers[i].rtt = peer->last_rtt / RIST_CLOCK;
@@ -282,6 +304,7 @@ void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *
 	}
 	cJSON_AddNumberToObject(json_stats, "quality", Q);
 	cJSON_AddNumberToObject(json_stats, "received", (double)flow->stats_instant.received);
+	cJSON_AddNumberToObject(json_stats, "received_bytes", (double)flow->stats_instant.received_bytes);
 	cJSON_AddNumberToObject(json_stats, "dropped_late", (double)flow->stats_instant.dropped_late);
 	cJSON_AddNumberToObject(json_stats, "dropped_full", (double)flow->stats_instant.dropped_full);
 	cJSON_AddNumberToObject(json_stats, "missing", (double)flow->stats_instant.missing);
@@ -301,11 +324,25 @@ void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *
 	cJSON_AddNumberToObject(json_stats, "min_inter_packet_spacing", (double)flow->stats_instant.min_ips);
 	cJSON_AddNumberToObject(json_stats, "cur_inter_packet_spacing", (double)flow->stats_instant.cur_ips);
 	cJSON_AddNumberToObject(json_stats, "max_inter_packet_spacing", (double)flow->stats_instant.max_ips);
+	/* Decay flow bitrate counters when no traffic has arrived since the last tick. */
+	rist_refresh_flow_bitrate(&flow->bw);
+	rist_refresh_flow_bitrate(&flow->bw_retries);
+	rist_refresh_flow_bitrate(&flow->bw_rejected);
+	rist_refresh_flow_bitrate(&flow->bw_tsnull);
 	cJSON_AddNumberToObject(json_stats, "bitrate", (double)flow->bw.bitrate);
 	cJSON_AddNumberToObject(json_stats, "bitrate_retries", (double)flow->bw_retries.bitrate);
 	cJSON_AddNumberToObject(json_stats, "bitrate_rejected", (double)flow->bw_rejected.bitrate);
 	cJSON_AddNumberToObject(json_stats, "bitrate_ts_nulls", (double)flow->bw_tsnull.bitrate);
 	cJSON_AddNumberToObject(json_stats, "bitrate_payload", (double)flow->bw.bitrate + (double)flow->bw_tsnull.bitrate);
+
+	if (ctx->merge_mode != LIBRIST_MERGE_MODE_OFF) {
+		cJSON *merge_obj = cJSON_AddObjectToObject(flow_obj, "merge");
+		const char *mode_str = ctx->merge_mode == LIBRIST_MERGE_MODE_AUTO ? "auto" : "pairs";
+		cJSON_AddStringToObject(merge_obj, "mode", mode_str);
+		cJSON_AddNumberToObject(merge_obj, "pairs_merged", (double)ctx->stats_pairs_merged);
+		cJSON_AddNumberToObject(merge_obj, "orphan_first_delivered", (double)ctx->stats_orphan_first_delivered);
+		cJSON_AddNumberToObject(merge_obj, "orphan_last_delivered", (double)ctx->stats_orphan_last_delivered);
+	}
 
 	char *stats_string = cJSON_PrintUnformatted(stats);
 	cJSON_Delete(stats);
@@ -323,6 +360,7 @@ void rist_receiver_flow_statistics(struct rist_receiver *ctx, struct rist_flow *
 	//stats_container->stats.receiver_flow.ts_nulls_bandwidth = flow->bw_tsnull.bitrate;
 	stats_container->stats.receiver_flow.sent = flow->peer_lst_len ? flow_sent_instant / flow->peer_lst_len : 0;
 	stats_container->stats.receiver_flow.received = flow->stats_instant.received;
+	stats_container->stats.receiver_flow.received_bytes = flow->stats_instant.received_bytes;
 	stats_container->stats.receiver_flow.missing = flow->stats_instant.missing;
 	stats_container->stats.receiver_flow.reordered = flow->stats_instant.reordered;
 	stats_container->stats.receiver_flow.recovered = flow->stats_instant.recovered;

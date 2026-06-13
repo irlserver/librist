@@ -25,12 +25,14 @@
 #include "socket-shim.h"
 #include "libevsocket.h"
 #include "librist.h"
+#include "librist/transport.h"
 #include "udpsocket.h"
 #include "crypto/psk.h"
 #include <errno.h>
 #include <stdatomic.h>
 #include "librist/logging.h"
 #include "proto/gre.h"
+#include "proto/adv.h"
 
 struct cJSON;
 
@@ -159,6 +161,9 @@ struct rist_peer_flow_stats {
 	uint64_t cur_ips;
 	uint32_t avg_count;
 	uint64_t total_ips;
+
+	/* Per-byte counters */
+	uint64_t received_bytes;
 };
 
 struct rist_peer_sender_stats {
@@ -169,6 +174,8 @@ struct rist_peer_sender_stats {
 	uint32_t bandwidth_skip;
 	uint32_t retrans_skip;
 	uint64_t ts_null;
+	uint64_t sent_bytes;
+	uint64_t retransmitted_bytes;
 };
 
 struct rist_peer_receiver_stats {
@@ -176,6 +183,7 @@ struct rist_peer_receiver_stats {
 	uint32_t received_rtcp;
 	uint64_t received;
 	uint64_t ts_null;
+	uint64_t received_bytes;
 };
 
 struct nacks {
@@ -255,6 +263,9 @@ struct rist_flow {
 	/* variable used for seq number length (16bit or 32bit) */
 	bool short_seq;
 
+	/* Scope-B merge auto-detection: set by keepalive L bit */
+	bool merge_auto_enabled;
+
 	/* Session timeouts variables */
 	uint64_t session_timeout;
 	uint64_t flow_timeout;
@@ -324,11 +335,20 @@ struct rist_common_ctx {
 	uint64_t stats_report_time;
 
 	enum rist_profile profile;
+	/* Set by rist_*_start() and by rist_peer_create() once a peer with
+	 * a definite profile has been inserted.  When set, rist_peer_create
+	 * refuses any peer whose ?profile= disagrees with cctx->profile. */
+	atomic_bool profile_locked;
 	uint8_t cname[RIST_MAX_HOSTNAME];
 
 	/* seq variables */
 	uint32_t seq;
 	uint16_t seq_rtp;
+
+	/* Advanced Profile (TR-06-3) state */
+	uint32_t adv_ssrc_base;       /* Even SSRC for Protected flow */
+	uint32_t adv_seq_protected;   /* 32-bit seq counter for even SSRC */
+	uint32_t adv_seq_unprotected; /* 32-bit seq counter for odd SSRC */
 
 	/* Peer counter (only the ones created by the API) */
 	uint32_t peer_counter;
@@ -359,6 +379,10 @@ struct rist_common_ctx {
 	bool debug;
 	uint32_t birthtime_rtp_offset;
 
+	/* Pluggable transport (default: POSIX sockets) */
+	struct rist_transport_ops transport;
+	bool transport_active;
+
 	/* Connection status callback */
 	connection_status_callback_t connection_status_callback;
 	void *connection_status_callback_argument;
@@ -387,6 +411,10 @@ struct rist_receiver {
 	receiver_session_timeout_callback_t receiver_session_timeout_callback;
 	void *receiver_session_timeout_callback_argument;
 
+	/* Receiver flow attribute callback (Advanced Profile CI=0x8001) */
+	receiver_flow_attr_callback_t receiver_flow_attr_callback;
+	void *receiver_flow_attr_callback_argument;
+
 	/* Receiver thread variables */
 	bool protocol_running;
 	pthread_t receiver_thread;
@@ -402,6 +430,11 @@ struct rist_receiver {
 	bool simulate_loss;
 	uint16_t loss_percentage;
 	uint32_t fifo_queue_size;
+
+	uint32_t merge_mode;
+	uint64_t stats_pairs_merged;
+	uint64_t stats_orphan_first_delivered;
+	uint64_t stats_orphan_last_delivered;
 };
 
 struct rist_sender {
@@ -412,6 +445,10 @@ struct rist_sender {
 	uint32_t recovery_maxbitrate_max;
 	uint32_t max_nacksperloop;
 	bool null_packet_suppression;
+
+	uint32_t split_mode;
+	uint64_t stats_pairs_emitted;
+	uint64_t stats_split_fallback_not_ts;
 
 	/* Sender thread variables */
 	bool protocol_running;
@@ -447,8 +484,9 @@ struct rist_sender {
 	uint64_t cooldown_time;
 	int cooldown_mode;
 
-	/* Recovery */
-	uint32_t seq_index[UINT16_SIZE];
+	/* Recovery — sized to RIST_SERVER_QUEUE_BUFFERS so Advanced Profile
+	 * can index with the full 32-bit seq space (seq & (queue_max - 1)). */
+	uint32_t seq_index[RIST_SERVER_QUEUE_BUFFERS];
 	size_t sender_recover_min_time;
 	size_t sender_queue_buffer_size;
 
@@ -566,6 +604,10 @@ struct rist_peer {
 	int eap_authentication_state;
 	uint8_t rist_gre_version;
 
+	/* Advanced Profile (TR-06-3) peer state */
+	bool is_advanced;              /* Peer operating in Advanced Profile mode */
+	bool remote_supports_advanced; /* Remote advertised I=1 in keep-alive */
+
 	/* compression flag (sender only) */
 	bool compression;
 
@@ -598,6 +640,9 @@ struct rist_peer {
 	struct rist_sender *sender_ctx;
 	struct rist_receiver *receiver_ctx;
 
+	/* Reflector role flags */
+	bool is_reflector_publisher;
+
 	/* rist buffer bloating counteract */
 	uint64_t cooldown_time;
 
@@ -628,6 +673,7 @@ struct rist_peer {
 	uint32_t rtcp_keepalive_interval;
 	uint64_t next_periodic_rtcp;
 	uint64_t next_keepalive_packet;
+	uint64_t next_flow_attr;
 	uint64_t session_timeout;
 	uint64_t last_pkt_received;
 	uint64_t last_sender_report_time;
@@ -638,6 +684,11 @@ struct rist_peer {
 	char cname[RIST_MAX_HOSTNAME];
 	uint8_t mac_addr[6];
 	bool send_first_connection_event;
+
+	/* Rate-limit for EMSGSIZE/PMTU-too-large send errors so a flow of
+	 * oversized packets doesn't drown the log. Holds the last log time
+	 * in NTP ticks. */
+	uint64_t last_pmtu_error_log;
 
 	uint64_t log_repeat_timer;
 
@@ -667,6 +718,7 @@ RIST_PRIV size_t rist_best_rtt_index(struct rist_flow *f);
 RIST_PRIV struct rist_buffer *rist_new_buffer(struct rist_common_ctx *ctx, const void *buf, size_t len, uint8_t type, uint32_t seq, uint64_t source_time, uint16_t src_port, uint16_t dst_port);
 RIST_PRIV void free_rist_buffer(struct rist_common_ctx *ctx, struct rist_buffer *b);
 RIST_PRIV void rist_calculate_bitrate(size_t len, struct rist_bandwidth_estimation *bw);
+RIST_PRIV void rist_refresh_flow_bitrate(struct rist_bandwidth_estimation *bw);
 RIST_PRIV void empty_receiver_queue(struct rist_flow *f, struct rist_common_ctx *ctx);
 RIST_PRIV void rist_flush_missing_flow_queue(struct rist_flow *flow);
 
@@ -694,6 +746,7 @@ RIST_PRIV struct rist_peer *rist_sender_peer_insert_local(struct rist_sender *ct
 RIST_PRIV void rist_fsm_init_comm(struct rist_peer *peer);
 RIST_PRIV int rist_oob_enqueue(struct rist_common_ctx *ctx, struct rist_peer *peer, const void *buf, size_t len);
 RIST_PRIV int init_common_ctx(struct rist_common_ctx *ctx, enum rist_profile profile);
+RIST_PRIV void init_advanced_state(struct rist_common_ctx *ctx);
 RIST_PRIV int rist_peer_remove(struct rist_common_ctx *ctx, struct rist_peer *peer, struct rist_peer **next);
 RIST_PRIV int rist_auth_handler(struct rist_common_ctx *ctx,
 								int (*conn_cb)(void *arg, const char *connecting_ip, uint16_t connecting_port, const char *local_ip, uint16_t local_port, struct rist_peer *peer),

@@ -67,8 +67,35 @@ typedef struct udpsocket_url_param {
  *
  * Returns: socket descriptor, -1 for error (errno is set)
  *
+ * Note: callers that bind() or connect() the socket should call
+ *       udpsocket_set_dontfragment() afterwards; on Windows,
+ *       IPV6_DONTFRAG setsockopt on an unbound IPv6 socket can
+ *       cause a subsequent bind() to fail with WSAEADDRNOTAVAIL.
  */
 RIST_API int udpsocket_open(uint16_t af);
+
+/* Set IP-level "don't fragment" on a UDP socket.
+ *
+ * Best-effort: platforms that do not support the option keep the
+ * default (fragmenting) behaviour; the failure is logged as a warning.
+ *
+ * On Windows, this must be called AFTER bind()/connect() for IPv6
+ * sockets (see rist/librist#212).
+ */
+RIST_API void udpsocket_set_dontfragment(int sd, uint16_t af);
+
+/* Set multicast TTL (IPv4) or hop limit (IPv6) on a UDP socket.
+ * A value of 0 means "use platform default".
+ * Returns 0 on success, -1 on error. */
+RIST_API int udpsocket_set_mcast_ttl(int sd, uint16_t af, uint32_t ttl);
+
+/* Join a multicast group.  [sd] must already be bound.
+ * [miface]: multicast interface name or IP (NULL or empty = default route).
+ * [sa]: multicast group sockaddr.
+ * [family]: AF_INET or AF_INET6.
+ * [ssm_source]: SSM source IP for IGMPv3 source filtering (NULL = ASM).
+ * Returns 0 on success, -1 on error. */
+RIST_API int udpsocket_join_mcast_group(int sd, const char *miface, struct sockaddr *sa, uint16_t family, const char *ssm_source);
 
 /* Open a udp socket and binds it to local [host] + [port].
  *
@@ -79,6 +106,13 @@ RIST_API int udpsocket_open(uint16_t af);
  *
  */
 RIST_API int udpsocket_open_bind(const char *host, uint16_t port, const char *mciface);
+
+/* Extended open+bind with multicast TTL and SSM source address support.
+ * ttl: multicast TTL (0 = platform default).
+ * ssm_source: SSM source IP address for IGMPv3 source filtering (NULL = ASM).
+ */
+RIST_API int udpsocket_open_bind_mcast(const char *host, uint16_t port, const char *mciface,
+                                        uint32_t ttl, const char *ssm_source);
 
 /*
  * Try to set RX buffer to 1Mbyte and fallback to 256Kbytes if that fails

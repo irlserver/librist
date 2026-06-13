@@ -16,6 +16,7 @@
 #include "librist_srp.h"
 #include "rist-private.h"
 #include "udp-private.h"
+#include "transport-private.h"
 #include "log-private.h"
 #include "proto/rist_time.h"
 #include "peer.h"
@@ -109,6 +110,9 @@ struct eapsrp_ctx
 	uint8_t *authenticator_bytes_salt;
 
 	bool eapversion3;//EAPv3 signalled. old libRIST used v2, so use this to ensure compat with broken hashing
+
+	bool srp_legacy_pad;         //srp-compat=1 URL opt-in
+	bool srp_legacy_peer_warned; //one-shot latch for the M1/M2 hint
 };
 
 static inline void eap_tries_inc(struct eapsrp_ctx *ctx)
@@ -238,7 +242,6 @@ static int process_eap_request_srp_challenge(struct eapsrp_ctx *ctx, uint8_t ide
 	if (salt_len > len - offset)
 		return EAP_LENERR;
 
-	bool use_default_2048 = true;
 	uint8_t *salt = &pkt[offset];
 	uint8_t *g = NULL;
 	uint8_t *N = NULL;
@@ -263,8 +266,9 @@ static int process_eap_request_srp_challenge(struct eapsrp_ctx *ctx, uint8_t ide
 		if (N_len > EAP_MAX_MODULUS_BYTES)
 			return EAP_LENERR;
 	}
+	bool use_default_ng = (generator_len == 0);
 	librist_crypto_srp_client_ctx_free(ctx->client_ctx);
-	ctx->client_ctx = librist_crypto_srp_client_ctx_create(use_default_2048, N, N_len, g, generator_len, salt, salt_len, ctx->eapversion3);
+	ctx->client_ctx = librist_crypto_srp_client_ctx_create(use_default_ng, N, N_len, g, generator_len, salt, salt_len, ctx->eapversion3, ctx->srp_legacy_pad);
 	if (ctx->client_ctx == NULL)
 		return EAP_INTERNALERR;
 	uint8_t response[1500] = {0};
@@ -338,6 +342,19 @@ static int process_eap_request_srp_server_validator(struct eapsrp_ctx *ctx, uint
 		return send_eapol_pkt(ctx, EAPOL_TYPE_EAP, EAP_CODE_RESPONSE, identifier, sizeof(*hdr), outpkt, ctx->eapversion3? 3 :2);
 	}
 	//perm failure
+	rist_log_priv2(ctx->config.logging_settings, RIST_LOG_WARN,
+		EAP_LOG_PREFIX"Server M2 verification failed for server@%s\n", ctx->ip_string);
+	/* Advisory hint, latched: see srp-compat note in NEWS for v0.2.18. */
+	if (!ctx->srp_legacy_peer_warned) {
+		ctx->srp_legacy_peer_warned = true;
+		if (ctx->srp_legacy_pad) {
+			rist_log_priv2(ctx->config.logging_settings, RIST_LOG_INFO,
+				EAP_LOG_PREFIX"  Hint: this side is configured with srp-compat=1. If the server is running librist 0.2.16+ (PAD-compliant, the default), drop ?srp-compat=1 on both sides.\n");
+		} else {
+			rist_log_priv2(ctx->config.logging_settings, RIST_LOG_INFO,
+				EAP_LOG_PREFIX"  Hint: if the server is running librist 0.2.15 or earlier, the SRP wire format changed in 0.2.16 for RFC 5054 / TR-06-2 compliance. To interoperate with an older server, add ?srp-compat=1 on BOTH URLs. Otherwise check the password.\n");
+		}
+	}
 	ctx->authentication_state = EAP_AUTH_STATE_FAILED;
 	ctx->tries = EAP_AUTH_TRIES_PERMANENT;
 
@@ -345,7 +362,7 @@ static int process_eap_request_srp_server_validator(struct eapsrp_ctx *ctx, uint
 }
 
 static int eap_srp_send_password(struct eapsrp_ctx *ctx, uint8_t identifier, const uint8_t *password, size_t password_len) {
-	if (password_len > (1500 - (EAPOL_EAP_HDRS_OFFSET + sizeof(struct eap_srp_hdr))))
+	if (password_len > (1500 - (EAPOL_EAP_HDRS_OFFSET + sizeof(struct eap_srp_hdr) + 1)))
 		return -1;
 	uint8_t outpkt[1500] = {0};
 	struct eap_srp_hdr *hdr = (struct eap_srp_hdr *)&outpkt[EAPOL_EAP_HDRS_OFFSET];
@@ -387,8 +404,6 @@ static int process_eap_request(struct eapsrp_ctx *ctx, uint8_t pkt[], size_t len
 {
 	if (len < 1)
 		return EAP_LENERR;
-	/* Record in-flight identifier for FAILURE matching. */
-	ctx->last_identifier = identifier;
 	uint8_t type = pkt[0];
 	if (type == EAP_TYPE_IDENTITY)
 		return process_eap_request_identity(ctx, identifier);
@@ -400,6 +415,11 @@ static int process_eap_request(struct eapsrp_ctx *ctx, uint8_t pkt[], size_t len
 		if (subtype != EAP_SRP_SUBTYPE_PASSWORD_REQUEST_RESPONSE && ctx->config.role == EAP_ROLE_AUTHENTICATOR)
 			return EAP_UNEXPECTEDREQUEST;
 
+		/* Record identifier for FAILURE matching only after validation
+		 * passes.  Moving this out of the prologue prevents an
+		 * unauthenticated spoofed REQUEST from priming last_identifier
+		 * and defeating the FAILURE-identifier gate. */
+		ctx->last_identifier = identifier;
 		switch (subtype)
 		{
 			case EAP_SRP_SUBTYPE_CHALLENGE:
@@ -470,7 +490,7 @@ static int process_eap_response_identity(struct eapsrp_ctx *ctx, size_t len, uin
 		if (verifier_data.default_ng)
 			librist_get_ng_constants(LIBRIST_SRP_NG_DEFAULT, &n_hex, &g_hex);
 
-		auth_ctx = librist_crypto_srp_authenticator_ctx_create(n_hex, g_hex, verifier_data.verifier, verifier_data.verifier_len, verifier_data.salt, verifier_data.salt_len, ctx->eapversion3);
+		auth_ctx = librist_crypto_srp_authenticator_ctx_create(n_hex, g_hex, verifier_data.verifier, verifier_data.verifier_len, verifier_data.salt, verifier_data.salt_len, ctx->eapversion3, ctx->srp_legacy_pad);
 		if (!auth_ctx)
 			goto out;
 		librist_crypto_srp_authenticator_ctx_free(ctx->auth_ctx);
@@ -548,6 +568,19 @@ static int process_eap_response_client_validator(struct eapsrp_ctx *ctx, size_t 
 
 	if (librist_crypto_srp_authenticator_verify_m1(ctx->auth_ctx, ctx->config.username, &pkt[4]) != 0) {
 		rist_log_priv2(ctx->config.logging_settings, RIST_LOG_WARN, EAP_LOG_PREFIX"Authentication failed for %s@%s\n", ctx->config.username, ctx->ip_string);
+		/* Advisory hint, latched: see srp-compat note in NEWS for v0.2.18. */
+		if (!ctx->srp_legacy_peer_warned) {
+			ctx->srp_legacy_peer_warned = true;
+			if (ctx->srp_legacy_pad) {
+				rist_log_priv2(ctx->config.logging_settings, RIST_LOG_INFO,
+					EAP_LOG_PREFIX"  Hint: this side is configured with srp-compat=1. If %s is running librist 0.2.16+ (PAD-compliant, the default), drop ?srp-compat=1 on both sides.\n",
+					ctx->ip_string);
+			} else {
+				rist_log_priv2(ctx->config.logging_settings, RIST_LOG_INFO,
+					EAP_LOG_PREFIX"  Hint: if %s is running librist 0.2.15 or earlier, the SRP wire format changed in 0.2.16 for RFC 5054 / TR-06-2 compliance. To interoperate with an older peer, add ?srp-compat=1 on BOTH URLs. Otherwise check the password.\n",
+					ctx->ip_string);
+			}
+		}
 		ctx->authentication_state = EAP_AUTH_STATE_FAILED;
 		eap_tries_inc(ctx);
 		int ret = EAP_AUTH_FAILED;
@@ -601,10 +634,22 @@ static int process_eap_response_srp_server_validator(struct eapsrp_ctx *ctx)
 }
 
 static int process_eap_response_passphrase(struct eapsrp_ctx *ctx, uint8_t identifier, size_t len, uint8_t pkt[]) {
-	if (ctx->authentication_state != EAP_AUTH_STATE_SUCCESS)//We cannot process it now,
+	if (ctx->authentication_state != EAP_AUTH_STATE_SUCCESS)
 		return 0;
 
-	// Need at least the flags byte (also avoids (len-1) underflow below)
+	/* If a solicited passphrase request is outstanding, only accept a
+	 * response whose identifier matches the request.  This prevents
+	 * replay or spoofed RESPONSEs from hijacking an active exchange.
+	 *
+	 * When no request is active the RESPONSE is an unsolicited
+	 * passphrase push (the protocol explicitly allows this — see
+	 * rist_eap_send_passphrase).  Its payload is AES-CTR encrypted
+	 * under the SRP session key, which provides integrity. */
+	bool matches_request = (ctx->passphrase_request_timer != 0 &&
+	                        identifier == ctx->passphrase_request_identifier);
+	if (ctx->passphrase_request_timer != 0 && !matches_request)
+		return 0;
+
 	if (len < 1)
 		return EAP_LENERR;
 	bool use_derived_key = CHECK_BIT(pkt[0], 7);
@@ -614,13 +659,13 @@ static int process_eap_response_passphrase(struct eapsrp_ctx *ctx, uint8_t ident
 	else
 		key = librist_crypto_srp_client_get_key(ctx->client_ctx);
 	if (use_derived_key) {
-		librist_peer_update_rx_passphrase(ctx->peer, key, SHA256_DIGEST_LENGTH, ctx->passphrase_request_timer != 0 && identifier == ctx->passphrase_request_identifier);
+		librist_peer_update_rx_passphrase(ctx->peer, key, SHA256_DIGEST_LENGTH, matches_request);
 	} else {
 		bool aes_256 = CHECK_BIT(pkt[0], 6);
 		uint8_t iv[16] = {0};
 		iv[15] = identifier;
 		_librist_crypto_aes_ctr(key, aes_256? 256: 128, iv, &pkt[1], &pkt[1], len -1);
-		librist_peer_update_rx_passphrase(ctx->peer, &pkt[1], len-1, ctx->passphrase_request_timer != 0 && identifier == ctx->passphrase_request_identifier);
+		librist_peer_update_rx_passphrase(ctx->peer, &pkt[1], len-1, matches_request);
 	}
 	uint8_t buf[EAPOL_EAP_HDRS_OFFSET];
 	if (ctx->passphrase_request_timer)
@@ -769,7 +814,10 @@ int eap_request_identity(struct eapsrp_ctx *ctx)
 {
 	uint8_t outpkt[EAPOL_EAP_HDRS_OFFSET +1];
 	outpkt[EAPOL_EAP_HDRS_OFFSET] = EAP_TYPE_IDENTITY;
-	ctx->last_identifier = (uint8_t)(prand_u32() >> 24);
+	uint32_t id_rand;
+	if (_librist_crypto_random_u32(&id_rand) != 0)
+		return -1;
+	ctx->last_identifier = (uint8_t)(id_rand >> 24);
 	return send_eapol_pkt(ctx, EAPOL_TYPE_EAP, EAP_CODE_REQUEST, ctx->last_identifier, 1, outpkt, ctx->eapversion3? 3 :2);
 }
 
@@ -780,7 +828,7 @@ int _librist_proto_eap_start(struct eapsrp_ctx *ctx)
 	struct eapol_hdr eapol;
 	eapol.eapversion = 3;
 	eapol.eaptype = EAPOL_TYPE_START;
-	eapol.length = htobe16(sizeof(eapol));
+	eapol.length = 0;
 	if (_librist_proto_gre_send_data(ctx->peer, 0, RIST_GRE_PROTOCOL_TYPE_EAPOL, (uint8_t*)&eapol, sizeof(eapol), 0, 0, ctx->peer->rist_gre_version) < 0)
 		return -1;
 	return 0;
@@ -788,8 +836,10 @@ int _librist_proto_eap_start(struct eapsrp_ctx *ctx)
 
 void eap_set_ip_string(struct eapsrp_ctx *ctx, char ip_string[])
 {
-	if (ctx != NULL)
-		memcpy(ctx->ip_string, ip_string, 46);
+	if (ctx != NULL) {
+		strncpy(ctx->ip_string, ip_string, sizeof(ctx->ip_string) - 1);
+		ctx->ip_string[sizeof(ctx->ip_string) - 1] = '\0';
+	}
 }
 
 int eap_clone_ctx(struct eapsrp_ctx *in, struct rist_peer *peer)
@@ -807,6 +857,7 @@ int eap_clone_ctx(struct eapsrp_ctx *in, struct rist_peer *peer)
 		return -1;
 	}
     memcpy(&ctx->config, &in->config, sizeof(in->config));
+	ctx->srp_legacy_pad = in->srp_legacy_pad;
 	peer->eap_ctx = ctx;
 	ctx->peer = peer;
 	ctx->eapversion3 = true;
@@ -922,7 +973,7 @@ static void eap_periodic_impl(struct eapsrp_ctx *ctx)
 	{
 		if (ctx->last_pkt)
 		{
-			sendto(ctx->peer->sd, (const char *)ctx->last_pkt, ctx->last_pkt_size, 0, &ctx->peer->u.address, ctx->peer->address_len);
+			rist_transport_sendto(ctx->peer, ctx->last_pkt, ctx->last_pkt_size, 0);
 			//check
 			ctx->timeout_retries++;
 			ctx->last_timestamp = now;
@@ -1096,6 +1147,10 @@ int rist_enable_eap_srp_2(struct rist_peer *peer, const char *username, const ch
 		ctx->config.role = EAP_ROLE_AUTHENTICATOR;
 		ctx->config.use_key_as_passphrase = peer->key_tx.password_len == 0;
 		ctx->eapversion3 = true;
+		ctx->srp_legacy_pad = (peer->config.srp_compat_legacy != 0);
+		if (ctx->srp_legacy_pad)
+			rist_log_priv2(ctx->config.logging_settings, RIST_LOG_WARN,
+				EAP_LOG_PREFIX"SRP legacy compat mode ACTIVE on this authenticator (srp-compat=1). Wire format is the pre-0.2.16 unpadded form — NOT TR-06-2 / RFC 5054 compliant. For transitional interop only.\n");
 		peer->eap_ctx = ctx;
 		struct rist_peer *child = peer->child;
 		peer->eap_authentication_state = 1;
@@ -1125,8 +1180,12 @@ int rist_enable_eap_srp_2(struct rist_peer *peer, const char *username, const ch
 	ctx->config.role = EAP_ROLE_AUTHENTICATEE;
 	strcpy(ctx->config.username, username);
 	strcpy(ctx->config.password, password);
+	ctx->srp_legacy_pad = (peer->config.srp_compat_legacy != 0);
 	peer->eap_ctx = ctx;
 	rist_log_priv2(ctx->config.logging_settings, RIST_LOG_INFO, EAP_LOG_PREFIX"EAP Authentication enabled, role = authenticatee\n");
+	if (ctx->srp_legacy_pad)
+		rist_log_priv2(ctx->config.logging_settings, RIST_LOG_WARN,
+			EAP_LOG_PREFIX"SRP legacy compat mode ACTIVE on this client (srp-compat=1). Wire format is the pre-0.2.16 unpadded form — NOT TR-06-2 / RFC 5054 compliant. For transitional interop only.\n");
 	ctx->eapversion3 = true;
 	if (!peer->multicast_receiver)
 		_librist_proto_eap_start(ctx);
