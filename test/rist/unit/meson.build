@@ -43,6 +43,23 @@ test_adv_roundtrip = executable('test_adv_roundtrip',
                                 dependencies : adv_test_deps)
 test('adv_roundtrip', test_adv_roundtrip, suite:['unit'])
 
+# EAP v4 crypto primitives (HKDF-Expand-SHA256 + AES-256-GCM) known-answer tests.
+# Compiles eap_v4_crypto.c directly to reach RIST_PRIV (hidden-visibility)
+# symbols. Gated on have_srp, which implies a real crypto backend (mbedTLS or
+# Nettle) is present; the built-in fallback has no AEAD.
+if have_srp
+	eap_v4_crypto_deps = [crypto_deps]
+	if host_machine.system() == 'windows'
+		eap_v4_crypto_deps += cc.find_library('bcrypt')  # mbedcrypto entropy_poll calls BCryptGenRandom
+	endif
+	test_eap_v4_crypto = executable('test_eap_v4_crypto',
+	                                'test_eap_v4_crypto.c',
+	                                '../../../src/crypto/eap_v4_crypto.c',
+	                                include_directories : inc,
+	                                dependencies : eap_v4_crypto_deps)
+	test('eap_v4_crypto', test_eap_v4_crypto, suite:['unit'])
+endif
+
 # URL ?profile= parsing exercised through the public rist_parse_address2 API.
 test_url_profile_parse = executable('test_url_profile_parse',
                                     'test_url_profile_parse.c',
@@ -83,3 +100,58 @@ test_nack_peer_select = executable('test_nack_peer_select',
                                    'test_nack_peer_select.c',
                                    include_directories : inc)
 test('nack_peer_select', test_nack_peer_select, suite:['unit'])
+
+# Receiver gap-detector sequence-number gap helper (rist_seq_gap): verifies
+# 16-bit wrap for short-sequence (Simple/Main) flows vs the true >64k gap for
+# 32-bit (Advanced) flows. Pure, link-free.
+test_seq_gap = executable('test_seq_gap',
+                          'test_seq_gap.c',
+                          include_directories : inc)
+test('seq_gap', test_seq_gap, suite:['unit'])
+
+# Expected-next-sequence helper (rist_seq_next): verifies 16-bit wrap for
+# short-sequence flows (incl. odd successors) and 32-bit successor for
+# Advanced flows. Pure, link-free.
+test_seq_next = executable('test_seq_next',
+                           'test_seq_next.c',
+                           include_directories : inc)
+test('seq_next', test_seq_next, suite:['unit'])
+
+# rist_recovery_depth_set() level -> ring-size mapping/resize contract.
+# Includes rist-private.h to inspect internal ring sizes.
+test_recovery_depth = executable('test_recovery_depth',
+                                 'test_recovery_depth.c',
+                                 include_directories : inc,
+                                 link_with : librist,
+                                 dependencies : [threads, stdatomic_dependency])
+test('recovery_depth', test_recovery_depth, suite:['unit'])
+
+# udp:// scheme-prefix parsing: guards prefix[16] against copy-length
+# underflow (leading '/') and out-of-bounds NUL write (over-long scheme).
+test_url_udp_prefix_parse = executable('test_url_udp_prefix_parse',
+                                       'test_url_udp_prefix_parse.c',
+                                       include_directories : inc,
+                                       link_with : librist)
+test('url_udp_prefix_parse', test_url_udp_prefix_parse, suite:['unit'])
+
+# ?recovery-depth= URL parsing exercised through the public API.
+test_url_recovery_depth_parse = executable('test_url_recovery_depth_parse',
+                                           'test_url_recovery_depth_parse.c',
+                                           include_directories : inc,
+                                           link_with : librist)
+test('url_recovery_depth_parse', test_url_recovery_depth_parse, suite:['unit'])
+
+# Retransmission sequence-domain predicate (header-only, no link needed):
+# an Advanced head-end serving a Main-downgraded peer must resolve that
+# peer's NACKs in the 16-bit RTP domain, else recovered_packets_total = 0.
+test_retx_seq_domain = executable('test_retx_seq_domain',
+                                  'test_retx_seq_domain.c',
+                                  include_directories : inc)
+test('retx_seq_domain', test_retx_seq_domain, suite:['unit'])
+
+# TUN CIDR parsing (IPv4 + IPv6) used by risttunnel -l.
+test_tun_cidr_parse = executable('test_tun_cidr_parse',
+                                 'test_tun_cidr_parse.c',
+                                 include_directories : inc,
+                                 link_with : librist)
+test('tun_cidr_parse', test_tun_cidr_parse, suite:['unit'])

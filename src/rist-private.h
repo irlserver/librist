@@ -39,9 +39,36 @@ struct cJSON;
 #undef RIST_DEPRECATED
 
 #define UINT16_SIZE (UINT16_MAX + 1)
-// These 4 control the memory footprint and buffer capacity of the lib
+
+/* Forward sequence-number gap. short_seq (Simple/Main) flows wrap at 16 bits;
+ * full 32-bit (Advanced) flows use the true difference so a genuine >64k gap is
+ * not truncated. Inputs are modular counters, so the subtraction is unsigned
+ * (well-defined wrap) before the optional 16-bit mask. */
+static inline uint32_t rist_seq_gap(uint32_t current, uint32_t last,
+                                    bool short_seq)
+{
+	uint32_t gap = current - last;
+	return short_seq ? (gap & UINT16_MAX) : gap;
+}
+
+/* Next expected sequence number after `last`. short_seq (Simple/Main) flows
+ * wrap at 16 bits; 32-bit (Advanced) flows use the natural successor. */
+static inline uint32_t rist_seq_next(uint32_t last, bool short_seq)
+{
+	uint32_t next = last + 1;
+	return short_seq ? (next & UINT16_MAX) : next;
+}
+
+// These control the memory footprint and buffer capacity of the lib
 // They MUST be a power of two or wrap-around index calculations will break
+// RIST_SERVER_QUEUE_BUFFERS is the DEFAULT Advanced-profile recovery-ring
+// capacity (in packets), == UINT16_SIZE << RIST_RECOVERY_DEPTH_DEFAULT (8x).
+// The ring is heap-allocated per flow/sender and can be resized at runtime to
+// UINT16_SIZE << depth via rist_recovery_depth_set() / ?recovery-depth=, up to
+// RIST_RECOVERY_QUEUE_MAX (depth 16, the full 32-bit space). Large depths are
+// limited by available RAM. Simple/Main are always UINT16_SIZE.
 #define RIST_SERVER_QUEUE_BUFFERS ((UINT16_SIZE) * 8)
+#define RIST_RECOVERY_QUEUE_MAX ((uint64_t)(UINT16_SIZE) << 16)
 #define RIST_RETRY_QUEUE_BUFFERS ((UINT16_SIZE) * 4)
 #define RIST_OOB_QUEUE_BUFFERS ((UINT16_SIZE) * 2)
 #define RIST_DATAOUT_QUEUE_BUFFERS (1024)
@@ -110,6 +137,22 @@ struct rist_buffer {
 	bool free;
 	bool retry_queued;
 };
+
+/* Largest recovery depth whose ring (UINT16_SIZE << depth packets) is
+ * addressable as size_t: the two parallel index arrays cost
+ * sizeof(ptr) + sizeof(uint32_t) per slot. Depth 16 (2^32) only fits a 64-bit
+ * size_t; on a 32-bit size_t the exponent is reduced until it fits. Shared with
+ * the recovery-depth unit test. */
+static inline int rist_recovery_depth_platform_max(void)
+{
+	const uint64_t per = (uint64_t)sizeof(struct rist_buffer *) + sizeof(uint32_t);
+	const uint64_t limit = (uint64_t)SIZE_MAX / per;
+	int depth = RIST_RECOVERY_DEPTH_MAX;
+	while (depth > RIST_RECOVERY_DEPTH_MIN &&
+	       ((uint64_t)UINT16_SIZE << depth) > limit)
+		depth--;
+	return depth;
+}
 
 struct rist_missing_buffer {
 	uint32_t seq;
@@ -195,7 +238,7 @@ struct rist_flow {
 	atomic_int shutdown;
 	int max_output_jitter;
 
-	struct rist_buffer *receiver_queue[RIST_SERVER_QUEUE_BUFFERS]; /* output queue */
+	struct rist_buffer **receiver_queue; /* output queue, heap-allocated to receiver_queue_max */
 
 	pthread_rwlock_t queue_lock;
 
@@ -313,6 +356,12 @@ struct rist_common_ctx {
 	/* Recovery buffer RTT multiplier (default 7, per RIST spec) */
 	int recovery_rtt_multiplier;
 
+	/* Advanced-profile recovery-ring capacity in packets (power of two).
+	 * Default RIST_SERVER_QUEUE_BUFFERS; tunable before rist_start() via
+	 * rist_recovery_depth_set(). Simple/Main ignore this and use
+	 * UINT16_SIZE. */
+	size_t recovery_queue_max;
+
 	/* Peer list sync - RW locks */
 	struct rist_peer *PEERS;
 	pthread_mutex_t peerlist_lock;
@@ -371,10 +420,18 @@ struct rist_common_ctx {
 	pthread_mutex_t stats_lock;
 
 	pthread_rwlock_t oob_queue_lock;
-	struct rist_buffer *oob_queue[RIST_OOB_QUEUE_BUFFERS]; /* oob queue */
+	struct rist_buffer *oob_queue[RIST_OOB_QUEUE_BUFFERS]; /* oob transmit queue */
 	size_t oob_queue_bytesize;
 	uint16_t oob_queue_read_index;
 	uint16_t oob_queue_write_index;
+
+	/* oob receive fifo: populated by the protocol thread when oob is
+	 * enabled but no callback is set, drained by rist_oob_read(). */
+	struct rist_buffer *oob_rx_queue[RIST_OOB_QUEUE_BUFFERS];
+	uint16_t oob_rx_queue_read_index;
+	uint16_t oob_rx_queue_write_index;
+	struct rist_buffer *oob_rx_current; /* backs the block handed out by the last rist_oob_read */
+	struct rist_oob_block oob_rx_block; /* borrowed view returned to the caller */
 
 	bool debug;
 	uint32_t birthtime_rtp_offset;
@@ -459,7 +516,7 @@ struct rist_sender {
 
 	bool sender_initialized;
 	uint32_t total_weight;
-	struct rist_buffer *sender_queue[RIST_SERVER_QUEUE_BUFFERS]; /* input queue */
+	struct rist_buffer **sender_queue; /* input queue, heap-allocated to sender_queue_max */
 	size_t sender_queue_bytesize;
 	size_t sender_queue_size;
 	size_t sender_queue_timelength;
@@ -484,9 +541,16 @@ struct rist_sender {
 	uint64_t cooldown_time;
 	int cooldown_mode;
 
-	/* Recovery — sized to RIST_SERVER_QUEUE_BUFFERS so Advanced Profile
+	/* Recovery - heap-allocated to sender_queue_max so Advanced Profile
 	 * can index with the full 32-bit seq space (seq & (queue_max - 1)). */
-	uint32_t seq_index[RIST_SERVER_QUEUE_BUFFERS];
+	uint32_t *seq_index;
+	/* Parallel 16-bit-RTP index (65536 entries), allocated only for an
+	 * Advanced-context sender. A peer that negotiated down to Main NACKs in
+	 * the 16-bit RTP sequence domain (nack_seq_msb = 0), which never matches
+	 * the 32-bit advanced seq_index; this lets the Advanced sender still find
+	 * and retransmit the requested packet for that peer. NULL on Main/Simple
+	 * senders (their primary seq_index is already the 16-bit domain). */
+	uint32_t *seq_rtp_index;
 	size_t sender_recover_min_time;
 	size_t sender_queue_buffer_size;
 
@@ -658,6 +722,9 @@ struct rist_peer {
 	int dead;
 	int timed_out;
 	uint64_t dead_since;
+	/* Caller-side socket rebind bookkeeping. */
+	uint64_t last_rebind_time;
+	uint32_t rebind_attempts;
 	uint64_t birthtime_peer;
 	uint64_t birthtime_local;
 
@@ -745,6 +812,8 @@ RIST_PRIV struct rist_peer *rist_sender_peer_insert_local(struct rist_sender *ct
 														  const struct rist_peer_config *config, bool b_rtcp);
 RIST_PRIV void rist_fsm_init_comm(struct rist_peer *peer);
 RIST_PRIV int rist_oob_enqueue(struct rist_common_ctx *ctx, struct rist_peer *peer, const void *buf, size_t len);
+
+RIST_PRIV int rist_oob_dequeue_rx(struct rist_common_ctx *ctx, const struct rist_oob_block **oob_block);
 RIST_PRIV int init_common_ctx(struct rist_common_ctx *ctx, enum rist_profile profile);
 RIST_PRIV void init_advanced_state(struct rist_common_ctx *ctx);
 RIST_PRIV int rist_peer_remove(struct rist_common_ctx *ctx, struct rist_peer *peer, struct rist_peer **next);
